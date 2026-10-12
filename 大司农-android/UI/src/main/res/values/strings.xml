@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">大司农</string>
+    <string name="notif_channel_name">大司农运行中</string>
+    <string name="notif_title">大司农正在局域网发现</string>
+
+    <!-- 通知渠道 -->
+    <string name="notif_channel_messages">消息</string>
+    <string name="notif_channel_transfers">文件传输</string>
+
+    <!-- 通知文案 -->
+    <string name="notif_from">来自 %1$s</string>
+    <string name="notif_file_kind">[%1$s] %2$s</string>
+    <string name="notif_kind_image">图片</string>
+    <string name="notif_kind_file">文件</string>
+    <string name="notif_transfer_done">已接收 %1$s</string>
+    <string name="notif_transfer_sent">已发送 %1$s</string>
+    <string name="notif_transfer_failed">传输失败：%1$s</string>
+    <string name="notif_transfer_progress">传输中 %1$d%% · %2$s</string>
+    <string name="notif_transfer_progress_multi">传输中 %1$d 个 · %2$d%% · %3$s</string>
+
+    <!-- 设置页：后台运行 -->
+    <string name="settings_section_background">— 后台运行 —</string>
+    <string name="settings_autostart">开机自启动</string>
+    <string name="settings_battery">电池优化白名单</string>
+    <string name="settings_battery_on">已加入</string>
+    <string name="settings_battery_off">去加入</string>
+    <string name="settings_notif_perm">通知权限</string>
+    <string name="settings_notif_on">已允许</string>
+    <string name="settings_notif_off">去允许</string>
+    <string name="settings_battery_hint">加入白名单后，锁屏/长时间后台也不容易被系统杀掉，能持续收消息与文件。</string>
+</resources>

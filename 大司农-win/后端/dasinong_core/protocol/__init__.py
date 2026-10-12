@@ -1,0 +1,52 @@
+"""协议子包：常量 / 帧编解码 / JSON 信封。"""
+from .constants import (
+    PROTO_VERSION,
+    PROTO_MIN,
+    UDP_DISCOVERY_PORT,
+    TCP_PORT,
+    MULTICAST_GROUP,
+    HELLO_INTERVAL,
+    PEER_TIMEOUT,
+    PING_INTERVAL,
+    PING_TIMEOUT,
+    CONNECT_TIMEOUT,
+    CHUNK_SIZE,
+    MAX_FRAME,
+    DEFAULT_PARALLEL,
+    MAX_PARALLEL,
+    DEFAULT_WINDOW_BYTES,
+    CANDIDATE_GATEWAYS,
+    HOTSPOT_BROADCASTS,
+)
+from .frame import (
+    FrameType,
+    ProtocolError,
+    pack_frame,
+    read_frame,
+    write_frame,
+    write_json_frame,
+    pack_data_hello,
+    parse_data_hello,
+    pack_chunk,
+    parse_chunk,
+    pack_chunk_ack,
+    parse_chunk_ack,
+    pack_data_done,
+    parse_data_done,
+    pack_data_error,
+    parse_data_error,
+    recv_exact,
+)
+from .messages import envelope, encode, decode, negotiate, new_id
+
+__all__ = [
+    "PROTO_VERSION", "PROTO_MIN", "UDP_DISCOVERY_PORT", "TCP_PORT", "MULTICAST_GROUP",
+    "HELLO_INTERVAL", "PEER_TIMEOUT", "PING_INTERVAL", "PING_TIMEOUT", "CONNECT_TIMEOUT",
+    "CHUNK_SIZE", "MAX_FRAME", "DEFAULT_PARALLEL", "MAX_PARALLEL", "DEFAULT_WINDOW_BYTES",
+    "CANDIDATE_GATEWAYS", "HOTSPOT_BROADCASTS",
+    "FrameType", "ProtocolError", "pack_frame", "read_frame", "write_frame",
+    "write_json_frame", "pack_data_hello", "parse_data_hello", "pack_chunk", "parse_chunk",
+    "pack_chunk_ack", "parse_chunk_ack", "pack_data_done", "parse_data_done",
+    "pack_data_error", "parse_data_error", "recv_exact",
+    "envelope", "encode", "decode", "negotiate", "new_id",
+]

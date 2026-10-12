@@ -1,0 +1,7 @@
+PySide6>=6.6
+psutil>=5.9
+# 加密隧道（dsn-tunnel v1）：口令 → P-256 身份、自签证书、公钥指纹
+cryptography>=42
+pytest>=7.0
+# 打包时用 JPG 生成多尺寸 ICO（scripts/build_win.ps1）
+Pillow>=10
