@@ -48,7 +48,8 @@ if ($Remove) {
 }
 
 netsh advfirewall firewall add rule name="$udpName" dir=in action=allow protocol=UDP localport=$UdpPort profile=any | Out-Null
-netsh advfirewall firewall add rule name="$tcpName" dir=in action=allow protocol=TCP localport=$TcpPort profile=any | Out-Null
+# TCP 放行**整段端口池**（主口 + 7 个备用口）：接口池会给每台设备各分一个口
+netsh advfirewall firewall add rule name="$tcpName" dir=in action=allow protocol=TCP localport="$TcpPort-$(([int]$TcpPort) + 7)" profile=any | Out-Null
 
 Write-Host "已放行入站：UDP $UdpPort / TCP $TcpPort （profile=any）" -ForegroundColor Green
 Write-Host "若仍连不上，请确认两台设备在同一网段，且对方程序也在运行。"

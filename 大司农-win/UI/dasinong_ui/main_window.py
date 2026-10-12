@@ -1621,11 +1621,13 @@ class MainWindow(QMainWindow):
         lines = [
             "@echo off",
             f'netsh advfirewall firewall delete rule name="Dasinong UDP {udp}" >nul 2>&1',
-            f'netsh advfirewall firewall delete rule name="Dasinong TCP {tcp}" >nul 2>&1',
+            f'netsh advfirewall firewall delete rule name="Dasinong TCP {tcp}-{int(tcp) + 7}" >nul 2>&1',
             f'netsh advfirewall firewall add rule name="Dasinong UDP {udp}" dir=in action=allow '
             f"protocol=UDP localport={udp} profile=any",
-            f'netsh advfirewall firewall add rule name="Dasinong TCP {tcp}" dir=in action=allow '
-            f"protocol=TCP localport={tcp} profile=any",
+            # TCP 放行**整段端口池**（37021-37028）：接口池会给每台设备各分一个口，
+            # 只放行主口的话，那些"专属口"的入站会被防火墙拦掉。
+            f'netsh advfirewall firewall add rule name="Dasinong TCP {tcp}-{int(tcp) + 7}" dir=in action=allow '
+            f"protocol=TCP localport={tcp}-{int(tcp) + 7} profile=any",
             "echo OK",
         ]
         bat = Path(tempfile.gettempdir()) / "dasinong_allow_firewall.bat"
