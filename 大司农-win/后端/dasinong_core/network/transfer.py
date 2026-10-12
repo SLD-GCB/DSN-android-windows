@@ -290,7 +290,9 @@ class TransferManager:
             for sf in send.files:
                 if not sf.remaining or sf.completed:
                     continue
-                slots = max(1, min(DEFAULT_PARALLEL, _count_pieces(sf.remaining, sf.entry.chunk_size)))
+                # 「TCP 并发」（设置页）：1~8；默认 3。填 1 = 单连接（与旧行为一致）
+                _par = max(1, min(MAX_PARALLEL, int(getattr(self, "parallel", DEFAULT_PARALLEL) or DEFAULT_PARALLEL)))
+                slots = max(1, min(_par, _count_pieces(sf.remaining, sf.entry.chunk_size)))
                 for _ in range(slots):
                     t = threading.Thread(target=self._send_worker, args=(send, sf, peer), daemon=True)
                     t.start()
@@ -312,23 +314,42 @@ class TransferManager:
                     self._publish(send_file_transfer(send, sf, "send", TransferState.FAILED, error="部分块发送失败"))
 
     def _current_tunnel(self):
+        """当前隧道上下文；`None` = 未接线。
+
+        ⚠ 刻意不吞异常：加密状态未知时必须 fail-closed（见 `_open_data_socket`）。
+        """
         if self._tunnel_provider is None:
             return None
-        try:
-            return self._tunnel_provider()
-        except Exception:
-            return None
+        return self._tunnel_provider()
 
     def _open_data_socket(self, ip: str, port: int) -> socket.socket:
-        """开一条数据连接；口令非空时包 TLS + 握手。"""
+        """开一条数据连接；本机启用加密时包 TLS + 握手。
+
+        失败一律**抛异常**（调用方会记进传输状态），绝不回退成明文 ——
+        数据连接与控制连接必须同等 fail-closed。
+        """
         sock = socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        tunnel = self._current_tunnel()
+        try:
+            tunnel = self._current_tunnel()
+        except Exception as exc:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise OSError(f"本机加密状态异常，已取消数据连接：{exc}") from exc
         if tunnel is not None and getattr(tunnel, "enabled", False):
-            sock = tunnel.connect(sock, ip)
+            try:
+                sock = tunnel.connect(sock, ip).sock
+            except Exception:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
         return sock
 
     def _send_worker(self, send: _Send, sf: _SendFile, peer: Peer) -> None:
@@ -496,7 +517,7 @@ class TransferManager:
         sess.send(messages.envelope("accept", self.cfg.device_id, sess.peer_id, {
             "transfer_id": tid,
             "files": accept_files,
-            "max_parallel": DEFAULT_PARALLEL,
+            "max_parallel": max(1, min(MAX_PARALLEL, int(getattr(self, "parallel", DEFAULT_PARALLEL) or DEFAULT_PARALLEL))),
             "window_bytes": DEFAULT_WINDOW_BYTES,
         }))
 

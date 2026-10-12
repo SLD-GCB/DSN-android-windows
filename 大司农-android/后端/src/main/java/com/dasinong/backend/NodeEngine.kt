@@ -18,6 +18,9 @@ import com.dasinong.backend.net.TransportManager
 import com.dasinong.backend.net.TunnelContext
 import com.dasinong.backend.protocol.Messages
 import com.dasinong.backend.protocol.Proto
+import com.dasinong.backend.security.AndroidKeyStoreSecretStore
+import com.dasinong.backend.security.Identity
+import com.dasinong.backend.security.SecretStore
 import com.dasinong.backend.store.ChatDb
 import com.dasinong.backend.util.Paths
 import kotlinx.coroutines.CoroutineScope
@@ -48,11 +51,40 @@ class NodeEngine(context: Context) {
     private val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val binder = LanNetworkBinder(cm)
 
+    /** 本地库（建表一律「有就不建、没有就建」= `CREATE TABLE IF NOT EXISTS`）。 */
     val store = ChatDb(context)
 
-    /** 隧道上下文（口令为空则 enabled=false，等价明文）。口令变更时整体替换。 */
+    /** 敏感数据的静态加密存储（系统密钥库；密钥不出库）。 */
+    private val secret: SecretStore = AndroidKeyStoreSecretStore()
+
+    /** 启动期异常（供 UI 展示 / 诊断）。要放在身份构造之前 —— 构造失败时要往里记。 */
+    private val startErrors = java.util.Collections.synchronizedList(ArrayList<String>())
+
+    /**
+     * 本机**长期身份** + 隧道上下文（v4：每设备随机，不再是口令派生）。
+     *
+     * ⚠ 构造失败**绝不能让 App 崩**（密钥库/磁盘在个别机型上会出意外）：记进 `startErrors`
+     * 并把两者置空 → 后续所有连接 fail-closed，但界面照常打开、把原因显示给用户。
+     */
+    private val identityAndTunnel: Pair<Identity?, TunnelContext?> = runCatching {
+        val hadIdentity = java.io.File(cfg.dataDir, Identity.KEY_FILE).isFile
+        val (ident, reused) = Identity.loadOrCreate(cfg.dataDir, secret)
+        if (hadIdentity && !reused) {
+            bus.publish(Event.LogEvent("本机身份已重新生成（原身份丢失），对端需要重新配对"))
+        }
+        ident to TunnelContext(ident)
+    }.getOrElse { e ->
+        val msg = "本机身份/加密初始化失败：${e.javaClass.simpleName}: ${e.message}"
+        startErrors.add(msg)
+        bus.publish(Event.LogEvent(msg))
+        null to null
+    }
+
+    val identity: Identity? = identityAndTunnel.first
+
+    /** 隧道上下文（v4 起恒为加密）；构造失败时为 null。 */
     @Volatile
-    private var tunnelCtx: TunnelContext = TunnelContext(store.settingGet("passphrase", "") ?: "")
+    private var tunnelCtx: TunnelContext? = identityAndTunnel.second
 
     val discovery = DiscoveryService(cfg, binder, bus, tunnelProvider = { tunnelCtx })
     val gateway = GatewayRendezvous(cfg, binder, bus, discovery, tunnelProvider = { tunnelCtx })
@@ -73,9 +105,20 @@ class NodeEngine(context: Context) {
         backoffUntil.remove(peerId)
         attempts.remove(peerId)
         noSessionSince[peerId] = 0L      // 立刻允许兜底反连
+        // **按需补连**：发送方（发消息/发文件）要用连接但没有 → 立刻拨一次。
+        // 这是"用户主动发送"触发的，不是后台循环，所以不会撞接口。
+        if (transport.getSession(peerId) == null) {
+            val peer = discovery.get(peerId)
+            if (peer != null) {
+                runCatching { transport.connectControl(peer.ip, peerId, peer.tcpPort) }
+            }
+        }
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    /** 配对：首次连接要人工确认（两端显示同一个 6 位短码），之后长期信任。 */
+    private val pairing = PairingManager(scope)
     private val seen = ConcurrentHashMap<String, Boolean>()
     private val backoffUntil = ConcurrentHashMap<String, Long>()
     private val attempts = ConcurrentHashMap<String, Int>()
@@ -89,7 +132,6 @@ class NodeEngine(context: Context) {
     // 下次启动可以直接拨回去，不必每次手输 IP。
     private val knownPeers: MutableMap<String, JSONObject> = loadKnownPeers()
     private val stopping = AtomicBoolean(false)
-    private val startErrors = java.util.Collections.synchronizedList(ArrayList<String>())
     private val outbox = java.util.concurrent.CopyOnWriteArrayList<PendingText>()
 
     private companion object {
@@ -98,6 +140,11 @@ class NodeEngine(context: Context) {
 
         /** 手动 IP 会话的临时 id 前缀（设备被发现后会被替换成真实 deviceId）。 */
         const val MANUAL_PREFIX = "ip:"
+
+        /** 「保持长连接」：心跳更密、容忍更久无响应（空闲也不断会话）。 */
+        const val KEEPALIVE_PING_MS = 2_000L
+        const val KEEPALIVE_TIMEOUT_MS = 60_000L
+
     }
 
     private val transferTypes = setOf(
@@ -230,6 +277,19 @@ class NodeEngine(context: Context) {
      * 不记的话被叫方虽然**能收**，却不知道对方在哪、**发不回去** ——
      * 热点下对方发不出广播，这是唯一的信息来源。
      */
+    /**
+     * 接口池：对端在身份里通告的 **给本机的专属口**（`tcp_ports[0]`）优先；
+     * 没有（老版本 v4 / 池满）则回落主口 `tcp_port`。
+     */
+    private fun dialPortOf(info: JSONObject): Int {
+        val arr = info.optJSONArray("tcp_ports")
+        if (arr != null && arr.length() > 0) {
+            val p = arr.optInt(0, 0)
+            if (p > 0) return p
+        }
+        return info.optInt("tcp_port", cfg.tcpPort)   // 回落主口（老版本 v4 / 池满）
+    }
+
     private fun learnIncomingPeer(info: JSONObject, ip: String) {
         val did = info.optString("device_id")
         if (did.isEmpty() || did == cfg.deviceId || ip.isEmpty()) return
@@ -237,7 +297,7 @@ class NodeEngine(context: Context) {
             deviceId = did,
             name = info.optString("name").ifEmpty { did.take(8) },
             ip = ip,
-            tcpPort = info.optInt("tcp_port", cfg.tcpPort),
+            tcpPort = dialPortOf(info),
             udpPort = info.optInt("udp_port", cfg.udpPort),
             deviceType = info.optString("device_type").ifEmpty { "unknown" },
             proto = info.optInt("proto", 1),
@@ -264,7 +324,7 @@ class NodeEngine(context: Context) {
                     deviceId = id,
                     name = info.optString("name").ifEmpty { id.take(8) },
                     ip = ip,
-                    tcpPort = info.optInt("tcp_port", cfg.tcpPort),
+                    tcpPort = dialPortOf(info),
                     udpPort = cfg.udpPort,
                     deviceType = info.optString("device_type").ifEmpty { "unknown" },
                 ),
@@ -299,6 +359,7 @@ class NodeEngine(context: Context) {
                 if (discovery.get(peer.deviceId) == null) {
                     runCatching { discovery.registerPeer(peer) }
                 }
+                // 配对**手动**：连上 ≠ 配对。
                 return true to "已连接 ${peer.name}"
             }
             return false to "连不上 ${peer.name}（$clean）"
@@ -310,7 +371,7 @@ class NodeEngine(context: Context) {
             deviceId = conn.peerId,
             name = info.optString("name").ifEmpty { conn.peerId.take(8) },
             ip = clean,
-            tcpPort = info.optInt("tcp_port", cfg.tcpPort),
+            tcpPort = dialPortOf(info),
             udpPort = info.optInt("udp_port", cfg.udpPort),
             deviceType = info.optString("device_type").ifEmpty { "unknown" },
             proto = info.optInt("proto", 1),
@@ -395,8 +456,12 @@ class NodeEngine(context: Context) {
     }
 
     fun addManualIp(ip: String) {
-        discovery.addManualTarget(ip)
-        gateway.addCandidate(ip)
+        val clean = ip.trim()
+        if (clean.isEmpty()) return
+        discovery.addManualTarget(clean)     // 同网段普通 WiFi：UDP 探测仍有用
+        gateway.addCandidate(clean)
+        // **socket 直连**（不依赖 UDP 广播）—— 热点主机场景唯一能成的一条
+        scope.launch { runCatching { connectByIp(clean) } }
     }
 
     // ------------------------------------------------------------ 后台驻留
@@ -407,24 +472,142 @@ class NodeEngine(context: Context) {
         runCatching { store.settingSet("autostart", if (enabled) "1" else "0") }
     }
 
-    // ------------------------------------------------------------ 隧道 / 口令
-    fun passphrase(): String = tunnelCtx.passphrase
+    // ------------------------------------------------------------ 身份 / 配对
+    /** 本机身份公钥指纹。⚠ **不要显示到界面上**（用户硬要求）。 */
+    fun fingerprint(): String = identity?.fingerprint ?: ""
 
-    /** 本机隧道公钥指纹（口令为空则空串）。供人工核对。 */
-    fun fingerprint(): String = tunnelCtx.fingerprint
+    /** v4 起恒为 true：身份是本机必需的，不存在"没加密"的运行模式。 */
+    fun isEncrypted(): Boolean = tunnelCtx != null
 
-    fun isEncrypted(): Boolean = tunnelCtx.enabled
+    // ---- 配对表 ----
+    fun pairedDevices(): List<ChatDb.PairedRow> = store.pairAll()
 
-    /** 设置/清除口令：重建身份与 TLS 上下文，并断开旧会话用新口令重连。 */
-    fun setPassphrase(value: String) {
-        val v = value.trim()
-        if (v == tunnelCtx.passphrase) return
-        tunnelCtx = TunnelContext(v)
-        runCatching { store.settingSet("passphrase", v) }
-        transport.sessions().forEach { runCatching { it.close() } }
-        bus.publish(
-            Event.LogEvent(if (v.isEmpty()) "已关闭加密（口令为空）" else "隧道口令已更新，正在用新口令重连"),
+    fun isPaired(deviceId: String): Boolean = store.pairGet(deviceId)?.trusted == true
+
+    /** 解绑：删掉信任记录并断开当前会话（下次连接需重新配对）。 */
+    fun unpair(deviceId: String) {
+        runCatching { store.pairRemove(deviceId) }
+        transport.sessions().forEach { if (it.peerId == deviceId) runCatching { it.close() } }
+        bus.publish(Event.PairedChanged(deviceId, false))
+        bus.publish(Event.LogEvent("已解绑 ${peerNameOf(deviceId)}"))
+    }
+
+    /** UI 回答「是否与这台设备配对」（配对弹窗的按钮回调）。 */
+    fun answerPairing(peerId: String, accept: Boolean) = pairing.answer(peerId, accept)
+
+    private fun peerNameOf(deviceId: String): String =
+        discovery.snapshot().firstOrNull { it.deviceId == deviceId }?.name ?: deviceId.take(8)
+
+    // ---- 配对流程：未配对时首次连接走一遍 ----
+    /** 懒判定该会话是否已配对；顺带发现"对方换了身份"。 */
+    private fun pairState(conn: ControlConnection): Boolean {
+        if (conn.peerFp.isEmpty()) return false
+        val row = store.pairGet(conn.peerId)
+        if (row == null) return false
+        if (row.fp != conn.peerFp) {
+            if (identityWarned.add(conn.peerId)) {
+                bus.publish(Event.LogEvent("对方身份已变更（可能重装/换机），需要重新配对"))
+            }
+            return false
+        }
+        return row.trusted
+    }
+
+    private val identityWarned = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 配对失败过的对端：不再**自动**发起配对，等用户手动（见 [requestPairing]）。 */
+    private val pairBlocked = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * **手动**发起/重试配对（UI 的「配对」按钮）。
+     *
+     * 配对失败后不会再自动重试（否则「拒绝→重连→再问」会变成连接风暴）；
+     * 要让某台设备重新配对，就手动点一次。返回 false 表示当前没有到该设备的连接。
+     */
+    fun requestPairing(peerId: String): Boolean {
+        pairBlocked.remove(peerId)
+        var conn = transport.getSession(peerId)
+        if (conn == null) {
+            // 还没连接 → **先直连一次**再发配对请求（这样"谁都能发配对请求"；
+            // 否则未连接时直接返回 false，表现就是"点配对没反应"）。
+            val peer = discovery.get(peerId)
+            if (peer != null) {
+                runCatching { transport.connectControl(peer.ip, peerId, peer.tcpPort) }
+                conn = transport.getSession(peerId)
+            }
+        }
+        if (conn == null) return false
+        beginPairing(conn)
+        return true
+    }
+
+    /** 由**拨号方**发起配对：先发 `pair_request`，同时在后台问本端用户。 */
+    private fun beginPairing(conn: ControlConnection) {
+        if (pairState(conn)) return
+        if (conn.peerId in pairBlocked) return   // 之前配对失败过：不再自动发起，等用户手动
+        val sas = Pairing.sasCode(conn.peerFp, identity?.fingerprint ?: "", conn.peerNonce)
+        val name = peerNameOf(conn.peerId)
+        conn.send(Messages.envelope("pair_request", cfg.deviceId, conn.peerId,
+            JSONObject().put("name", cfg.deviceName)))
+        pairing.askAsync(
+            peerId = conn.peerId,
+            peerName = name,
+            sas = sas,
+            onAsk = { bus.publish(Event.PairRequestEvent(it)) },
+            onAnswer = { ok ->
+                conn.pairOwnOk = ok
+                conn.send(Messages.envelope(
+                    if (ok) "pair_accept" else "pair_reject", cfg.deviceId, conn.peerId, JSONObject()))
+                if (ok) finishPairing(conn, name) else {
+                    pairBlocked.add(conn.peerId)
+                    bus.publish(Event.LogEvent("与 $name 的配对未完成（可在设备列表里手动点「配对」）"))
+                }
+            },
         )
+    }
+
+    /** 被叫方收到配对请求：算短码 → 问本端用户 → 回 accept/reject。 */
+    private fun onPairRequest(conn: ControlConnection, env: JSONObject) {
+        val data = env.optJSONObject("data") ?: JSONObject()
+        val name = data.optString("name").ifEmpty { peerNameOf(conn.peerId) }
+        val sas = Pairing.sasCode(conn.peerFp, identity?.fingerprint ?: "", conn.peerNonce)
+        pairing.askAsync(
+            peerId = conn.peerId,
+            peerName = name,
+            sas = sas,
+            onAsk = { bus.publish(Event.PairRequestEvent(it)) },
+            onAnswer = { ok ->
+                conn.pairOwnOk = ok
+                conn.send(Messages.envelope(
+                    if (ok) "pair_accept" else "pair_reject", cfg.deviceId, conn.peerId, JSONObject()))
+                if (ok) finishPairing(conn, name) else bus.publish(Event.LogEvent("已取消配对"))
+            },
+        )
+    }
+
+    /** 收到对端的 `pair_accept` / `pair_ok` → 记下"对端已同意"。 */
+    private fun onPeerAcceptedPairing(conn: ControlConnection) {
+        conn.pairPeerOk = true
+        finishPairing(conn, peerNameOf(conn.peerId))
+    }
+
+    /** **两端都同意**后才落库（不产生"半信任"）。 */
+    private fun finishPairing(conn: ControlConnection, name: String) {
+        if (pairState(conn)) return
+        if (!(conn.pairOwnOk && conn.pairPeerOk)) return
+        val label = name.ifEmpty { peerNameOf(conn.peerId) }
+        val ok = runCatching {
+            store.pairUpsert(conn.peerId, conn.peerFp, label)
+            true
+        }.getOrDefault(false)
+        if (!ok) {
+            bus.publish(Event.LogEvent("保存配对失败"))
+            return
+        }
+        conn.send(Messages.envelope("pair_ok", cfg.deviceId, conn.peerId,
+            JSONObject().put("fp", identity?.fingerprint ?: "")))
+        bus.publish(Event.PairedChanged(conn.peerId, true))
+        bus.publish(Event.LogEvent("已与 $label 配对"))
     }
 
     // ------------------------------------------------------------ 生命周期
@@ -436,6 +619,14 @@ class NodeEngine(context: Context) {
         bus.subscribe(::onPeerForBind)
         // 逐个启动：任一子系统失败不影响其余，否则会表现为「能发现设备但建不起 TCP 连接」
         startErrors.clear()
+        // **强制加密**：没设口令就什么都不启（不监听、不广播），
+        // 否则等于把明文服务默认暴露在同网段里。在「设置」里设好口令后重启即可。
+        if (!isEncrypted()) {
+            val msg = "未设置隧道口令 —— 为安全起见已停用网络功能。请在「设置」里设置口令后重试。"
+            startErrors.add(msg)
+            bus.publish(Event.LogEvent(msg))
+            return
+        }
         val steps = listOf<Pair<String, () -> Unit>>(
             "发现服务" to { discovery.start() },
             "网关中继" to { gateway.start() },
@@ -646,12 +837,40 @@ class NodeEngine(context: Context) {
     // ------------------------------------------------------------ 控制派发
     private fun onControl(conn: ControlConnection, env: JSONObject) {
         val peerId = conn.peerId
-        when (env.optString("type")) {
-            "ping" -> conn.send(Messages.envelope("pong", cfg.deviceId, peerId, JSONObject()))
-            "pong" -> conn.lastPong = System.currentTimeMillis()
+        val mtype = env.optString("type")
+        // ---- 配对协商（任何一侧都可能发）----
+        when (mtype) {
+            "pair_request" -> { onPairRequest(conn, env); return }
+            "pair_accept", "pair_ok" -> { onPeerAcceptedPairing(conn); return }
+            "pair_reject" -> {
+                pairBlocked.add(peerId)
+                bus.publish(Event.LogEvent("对方拒绝配对（可在设备列表里手动点「配对」重试）"))
+                return
+            }
+        }
+        // ---- 保活（配对前也允许）----
+        if (mtype == "ping") {
+            conn.send(Messages.envelope("pong", cfg.deviceId, peerId, JSONObject()))
+            return
+        }
+        if (mtype == "pong") {
+            conn.lastPong = System.currentTimeMillis()
+            return
+        }
+        // ---- 未配对闸门：除保活/配对外，业务帧一律拒绝 ----
+        if (!pairState(conn)) {
+            runCatching {
+                conn.send(Messages.envelope(
+                    "error", cfg.deviceId, peerId,
+                    JSONObject().put("code", "unpaired").put("message", "尚未配对：请先在对端确认配对"),
+                ))
+            }
+            return
+        }
+        when (mtype) {
             "text" -> onText(env, peerId)
             "delivered" -> onDelivered(env)
-            else -> if (env.optString("type") in transferTypes) {
+            else -> if (mtype in transferTypes) {
                 runCatching { transfer.handleControl(conn, env) }
             }
         }
@@ -727,10 +946,40 @@ class NodeEngine(context: Context) {
     }
 
     // ------------------------------------------------------------ 维护循环
+    /** 上次「直连网关做发现」的时间（节流）。 */
+    private var gwDiscoverAt = System.currentTimeMillis()
+
+    /** 探网关是否正在进行（防重入叠加）。 */
+    @Volatile private var gwProbing = false
+
+    /**
+     * **自动发现**兜底：TCP 直连默认网关（热点主机）把对方登记进发现表。
+     *
+     * 谁当客户端谁就探一次 —— 这样「手机开热点」和「电脑开热点」两种组网都能互相发现；
+     * 局域网里 UDP 广播本来就好使，这里只是兜底。⚠ 只做发现，不自动配对。
+     */
+    private fun autoDiscoverGateway(now: Long) {
+        if (discovery.snapshot().isNotEmpty()) return
+        if (transport.sessions().isNotEmpty()) return      // 已有会话，不必再探
+        if (gwProbing) return                              // 上一次还在探 → 别叠加
+        if (now - gwDiscoverAt < 8_000L) return
+        gwDiscoverAt = now
+        val gw = runCatching { binder.defaultGateway() }.getOrNull() ?: return
+        gwProbing = true
+        scope.launch {
+            try {
+                runCatching { connectByIp(gw) }
+            } finally {
+                gwProbing = false
+            }
+        }
+    }
+
     private suspend fun maintenanceLoop() {
         while (scope.isActive && !stopping.get()) {
             val now = System.currentTimeMillis()
             ensureSessions(now)
+            autoDiscoverGateway(now)           // 自动发现（只登记，不配对）
             pingSessions(now)
             flushOutbox()
             runCatching { gateway.prune() }
@@ -759,7 +1008,7 @@ class NodeEngine(context: Context) {
                     deviceId = pid,
                     name = info.optString("name").ifEmpty { pid.take(8) },
                     ip = ip,
-                    tcpPort = info.optInt("tcp_port", cfg.tcpPort),
+                    tcpPort = dialPortOf(info),
                     udpPort = cfg.udpPort,
                     deviceType = info.optString("device_type").ifEmpty { "unknown" },
                 ),
@@ -768,6 +1017,10 @@ class NodeEngine(context: Context) {
         }
         for (peer in peers) {
             val pid = peer.deviceId
+            if (peer.incompatible) {
+                // 版本协商不通过：能看见但不拨号，避免白发连接与一堆失败日志
+                continue
+            }
             var remember = false
             var online = peer
             val sess = transport.getSession(pid)
@@ -799,37 +1052,79 @@ class NodeEngine(context: Context) {
                 backoffUntil.remove(pid)
                 noSessionSince.remove(pid)
             } else {
-                if (now < (backoffUntil[pid] ?: 0L)) continue
-                // 首选由 deviceId 较小的一方发起；等待 FALLBACK_DELAY 仍无连接时，另一侧兜底反连，
-                // 否则“首选方向”被防火墙/路由挡住就永远连不上。
-                val since = noSessionSince.getOrPut(pid) { now }
-                val isCanon = cfg.deviceId < pid
-                if (!isCanon && now - since < FALLBACK_DELAY_MS) continue
-                val conn = transport.connectControl(peer.ip, pid, peer.tcpPort)
-                if (conn == null) {
-                    val n = (attempts[pid] ?: 0) + 1
-                    attempts[pid] = n
-                    val table = longArrayOf(500, 1000, 2000, 4000, 8000, 15000)
-                    var delayMs = table[minOf(n - 1, table.size - 1)]
-                    delayMs = (delayMs * (1 + (Math.random() - 0.5) * 0.4)).toLong()
-                    // 只在「记忆里」而不在发现表里的对端：放慢重试，避免在别的网络里空拨
-                    if (discovery.get(pid) == null) delayMs *= 4
-                    backoffUntil[pid] = now + delayMs
-                } else {
-                    remember = true
-                }
+                // ⚠ **不做任何自动重连**：闲置关闭时长见设置页；「保持长连接」= 无限期不关。
+                // 掉线后要连请手动点「连接」。
             }
             if (remember) rememberPeer(online)
         }
     }
 
+    /** 「保持长连接」开关（落盘，重启后保持）：更密心跳 + 空闲不断开。 */
+    @Volatile
+    var keepAlive: Boolean =
+        runCatching { store.settingGet("keep_alive", "0") == "1" }.getOrDefault(false)
+
+    /** 连接闲置多久自动关闭（分钟，落盘）。「保持长连接」开着时无限期。 */
+    @Volatile
+    var connTimeoutMin: Int =
+        runCatching { (store.settingGet("conn_timeout_min", "10") ?: "10").toInt() }
+            .getOrDefault(10)
+
+    /** 「TCP 并发」：一次传输并发几条数据连接（1~8，填 1 = 单连接）。落盘。 */
+    @Volatile
+    var tcpConcurrency: Int =
+        runCatching { (store.settingGet("tcp_concurrency", "3") ?: "3").toInt() }
+            .getOrDefault(3)
+            .coerceIn(1, 8)
+
+    // 启动即把设置里的并发数写进传输引擎（否则只有改设置那一刻才生效）
+    init { runCatching { transfer.maxParallel = tcpConcurrency } }
+
+    fun concurrency(): Int = tcpConcurrency
+
+    fun setConcurrency(n: Int) {
+        tcpConcurrency = n.coerceIn(1, 8)
+        runCatching { transfer.maxParallel = tcpConcurrency }   // 立刻生效（并发发送数）
+        runCatching { store.settingSet("tcp_concurrency", tcpConcurrency.toString()) }
+    }
+
+    fun connTimeoutMinutes(): Int = connTimeoutMin
+
+    fun setConnTimeoutMinutes(minutes: Int) {
+        connTimeoutMin = minutes.coerceAtLeast(1)
+        runCatching { store.settingSet("conn_timeout_min", connTimeoutMin.toString()) }
+    }
+
+    fun setKeepAliveEnabled(on: Boolean) {
+        keepAlive = on
+        runCatching { store.settingSet("keep_alive", if (on) "1" else "0") }
+        bus.publish(Event.LogEvent(if (on) "已开启「保持长连接」" else "已关闭「保持长连接」"))
+        if (on) {
+            // 一次性：把已发现的设备各接一次（之后不再自动重连、也不会自动关）
+            scope.launch {
+                runCatching {
+                    for (peer in discovery.snapshot()) {
+                        if (transport.getSession(peer.deviceId) == null) {
+                            runCatching {
+                                transport.connectControl(peer.ip, peer.deviceId, peer.tcpPort)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun pingSessions(now: Long) {
+        val pingMs = if (keepAlive) KEEPALIVE_PING_MS else Proto.PING_INTERVAL_MS
+        // 闲置关闭：保持长连接 = **无限期**；否则用设置里的分钟数
+        val timeoutMs = if (keepAlive) Long.MAX_VALUE else connTimeoutMin.toLong() * 60_000L
         for (conn in transport.sessions()) {
-            if (now - conn.lastPong > Proto.PEER_TIMEOUT_MS) {
+            if (now - conn.lastPong > timeoutMs) {
                 conn.close()
                 continue
             }
-            if (now - (lastPing[conn.peerId] ?: 0L) >= Proto.PING_INTERVAL_MS) {
+            if (now - (lastPing[conn.peerId] ?: 0L) >= pingMs) {
                 lastPing[conn.peerId] = now
                 conn.send(Messages.envelope("ping", cfg.deviceId, conn.peerId, JSONObject()))
             }

@@ -37,12 +37,14 @@ def _engine(tmp_path, tag: str, name: str, tcp_port: int, udp_port: int) -> Node
 
 
 def _pair(tmp_path, tag: str, passphrase: str = ""):
-    """两台互相发现不到的引擎（udp_port 不同 = 模拟热点下手机发不出广播）。"""
+    """两台互相发现不到的引擎（udp_port 不同 = 模拟热点下手机发不出广播）。
+
+    v4 起没有口令了：身份是每设备随机的，首次连接由集成测试的 `DASINONG_PAIR_AUTO=1`
+    自动完成配对（见 `conftest.py`）。
+    """
     n = int(tag)
     a = _engine(tmp_path, tag, "A", 47000 + n * 10, 47200 + n * 10)
     b = _engine(tmp_path, tag, "B", 47001 + n * 10, 47201 + n * 10)
-    a.set_passphrase(passphrase)
-    b.set_passphrase(passphrase)
     a.start()
     b.start()
     return a, b
@@ -95,12 +97,28 @@ def test_direct_connect_upgrades_manual_conversation(tmp_path):
         _close(a, b)
 
 
+def _wait_paired(*engines, timeout: float = 20.0) -> None:
+    """v4：首次连接要先**配对**（测试里由 `DASINONG_PAIR_AUTO=1` 自动接受）。
+
+    业务帧（文本/文件）只有在配对完成后才被接受 —— 真实 UI 里表现为"未配对时发送按钮禁用"。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(
+            any(e.is_paired(o.cfg.device_id) for o in engines if o is not e)
+            for e in engines
+        ):
+            return
+        time.sleep(0.1)
+
+
 def test_direct_connect_transfers_both_ways(tmp_path):
     """直连建立后，双向传文件都要成功（热点下「电脑往手机传」也是这个路径）。"""
     a, b = _pair(tmp_path, "3")
     try:
         ok, msg = a.connect_by_ip("127.0.0.1", b.cfg.tcp_port)
         assert ok, msg
+        _wait_paired(a, b)
 
         payload_a = b"hello-from-a" * 40000
         payload_b = b"hello-from-b" * 40000
@@ -141,23 +159,6 @@ def test_peer_stays_stable_without_udp(tmp_path):
         assert len(added) <= 1, f"不该反复重新加入: {added}"
         assert a.is_connected(b.cfg.device_id), "控制连接应保持"
         assert any(p.device_id == b.cfg.device_id for p in a.peers()), "对端应一直在列表里"
-    finally:
-        _close(a, b)
-
-
-def test_direct_connect_wrong_passphrase_reports_readable_error(tmp_path):
-    """口令不一致时必须返回可读原因（而不是静默失败/卡死）。"""
-    a = _engine(tmp_path, "4", "A", 47040, 47240)
-    b = _engine(tmp_path, "4", "B", 47041, 47241)
-    a.set_passphrase("pw-A-different")
-    b.set_passphrase("pw-B-different")
-    a.start()
-    b.start()
-    try:
-        ok, msg = a.connect_by_ip("127.0.0.1", b.cfg.tcp_port, timeout=5)
-        assert not ok
-        assert ("口令" in msg) or ("身份" in msg), f"错误文案应能提示口令问题，实际：{msg}"
-        assert not a.is_connected(b.cfg.device_id)
     finally:
         _close(a, b)
 

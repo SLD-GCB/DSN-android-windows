@@ -100,8 +100,10 @@ class DiscoveryService(
         val tunnel = currentTunnel()
         if (tunnel != null && tunnel.enabled) {
             data.put("enc", 1)
+            // v4：带**本机公钥**与**设备私钥签名**（不再有口令派生的 HMAC）
+            data.put("pub", tunnel.spkiB64)
             data.put(
-                "mac",
+                "sig",
                 tunnel.signHello(
                     Tunnel.helloFields(cfg.deviceId, cfg.deviceName, cfg.deviceType, cfg.tcpPort, cfg.udpPort, ts),
                 ),
@@ -229,24 +231,29 @@ class DiscoveryService(
         val data = env.optJSONObject("data") ?: JSONObject()
         val encrypted = jsonFlag(data, "enc")
 
-        // 本机已启用加密 → 只认签名正确的 hello（防同网段伪造设备冒进列表）
+        // v4：hello 用**设备私钥**签名（`pub`/`sig`）。验不过就丢弃 —— 防同网段伪造设备冒进列表。
+        // `sig` 覆盖 `from`，所以顺带防了 deviceId 冒用。
         val tunnel = currentTunnel()
         if (tunnel != null && tunnel.enabled) {
-            val mac = data.optString("mac")
-            val expect = tunnel.signHello(
-                Tunnel.helloFields(
-                    id,
-                    data.optString("name"),
-                    data.optString("device_type", "android"),
-                    data.optInt("tcp_port", Proto.TCP_PORT),
-                    data.optInt("udp_port", cfg.udpPort),
-                    data.optLong("ts", 0L),
-                ),
+            val fields = Tunnel.helloFields(
+                id,
+                data.optString("name"),
+                data.optString("device_type", "android"),
+                data.optInt("tcp_port", Proto.TCP_PORT),
+                data.optInt("udp_port", cfg.udpPort),
+                data.optLong("ts", 0L),
             )
-            if (mac.isEmpty() || mac != expect) return
+            if (!Tunnel.verifyHello(data.optString("pub"), fields, data.optString("sig"))) return
         }
 
         val now = System.currentTimeMillis()
+        val proto = env.optInt("proto", 1)
+        // 版本协商：对不上就只登记进列表、**不拨号**（UI 会提示"需升级"）
+        val incompatible = Messages.negotiate(
+            proto,
+            data.optInt("proto_min", proto),
+            data.optInt("proto_max", proto),
+        ) < 0
         val existing = peers[id]
         if (existing == null) {
             val peer = Peer(
@@ -256,8 +263,9 @@ class DiscoveryService(
                 tcpPort = data.optInt("tcp_port", Proto.TCP_PORT),
                 udpPort = data.optInt("udp_port", cfg.udpPort),
                 deviceType = data.optString("device_type", "android"),
-                proto = env.optInt("proto", 1),
+                proto = proto,
                 encrypted = encrypted,
+                incompatible = incompatible,
                 lastSeen = now,
             )
             peers[id] = peer
@@ -266,8 +274,10 @@ class DiscoveryService(
             val changed = existing.ip != srcIp ||
                 existing.name != data.optString("name", existing.name) ||
                 existing.tcpPort != data.optInt("tcp_port", existing.tcpPort) ||
-                existing.encrypted != encrypted
+                existing.encrypted != encrypted ||
+                existing.incompatible != incompatible
             existing.ip = srcIp
+            existing.incompatible = incompatible
             existing.name = data.optString("name", existing.name)
             existing.tcpPort = data.optInt("tcp_port", existing.tcpPort)
             existing.udpPort = data.optInt("udp_port", existing.udpPort)

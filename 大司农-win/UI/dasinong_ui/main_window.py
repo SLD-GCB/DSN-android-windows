@@ -12,8 +12,10 @@ from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
+from PySide6.QtWidgets import QCheckBox, QSpinBox
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -38,6 +40,7 @@ from PySide6.QtWidgets import (
 from dasinong_core.config import Config, load_prefs, save_prefs
 from dasinong_core.models import ChatMessage, MsgKind, Peer, Transfer, TransferState
 from dasinong_core.node import NodeEngine
+from dasinong_core.pairing import PAIR_TIMEOUT
 from dasinong_core.protocol.constants import PROTO_VERSION
 
 from . import theme
@@ -85,6 +88,87 @@ if ($rules) {{
 '''
 
 
+class PairingDialog(QDialog):
+    """配对确认：两端显示**同一个 6 位数字**，核对一致才点「配对」。
+
+    刻意**不显示任何指纹**（用户硬要求）—— 6 位码是本次会话的临时值，不是身份指纹。
+    """
+
+    def __init__(self, peer_name: str, sas: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("配对确认")
+        self.setModal(True)
+        self._left = max(1, int(PAIR_TIMEOUT))          # 与后端等待超时对齐
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"设备「{peer_name}」请求与你配对。"))
+        layout.addWidget(QLabel("请核对两台设备屏幕上显示的数字是否**完全相同**："))
+        code = QLabel(" ".join(sas) if sas else "——")
+        code.setAlignment(Qt.AlignCenter)
+        code.setStyleSheet("font-size:34px; font-weight:bold; letter-spacing:6px;")
+        layout.addWidget(code)
+        self._tip = QLabel("")
+        self._tip.setWordWrap(True)
+        layout.addWidget(self._tip)
+        self._render_tip()
+        row = QHBoxLayout()
+        ok = QPushButton("配对")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(ok)
+        row.addWidget(cancel)
+        layout.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+
+    def _render_tip(self) -> None:
+        self._tip.setText(
+            "一致 → 点「配对」；**不一致**说明有人在中间冒充，请点「取消」。\n"
+            f"（{self._left} 秒内未确认将自动取消）"
+        )
+
+    def _tick(self) -> None:
+        self._left -= 1
+        if self._left <= 0:
+            self.reject()
+            return
+        self._render_tip()
+
+
+class _PillSwitch(QCheckBox):
+    """胶囊滑块开关（自绘药丸轨道 + 圆钮），观感与手机端一致。"""
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(24)
+        self.setMinimumWidth(124)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        from PySide6.QtGui import QBrush, QColor, QPainter, QPen
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        h, w = 18, 36
+        top = (self.height() - h) // 2
+        on = self.isChecked()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor("#2e7d32") if on else QColor("#bdbdbd")))
+        p.drawRoundedRect(0, top, w, h, h / 2, h / 2)
+        d = h - 4
+        x = (w - d - 2) if on else 2
+        p.setBrush(QBrush(QColor("#ffffff")))
+        p.setPen(QPen(QColor("#9e9e9e"), 1))
+        p.drawEllipse(x, top + 2, d, d)
+        p.setPen(QPen(QColor("#333333")))
+        p.drawText(w + 8, 0, self.width() - w - 8, self.height(),
+                   Qt.AlignVCenter | Qt.AlignLeft, self.text())
+        p.end()
+
+
 class MainWindow(QMainWindow):
     diagnosisDone = Signal(str)
     firewallStatusReady = Signal(bool, str)   # (是否已放行, 说明)
@@ -99,6 +183,8 @@ class MainWindow(QMainWindow):
         self._peers: Dict[str, Peer] = {}
         self._current_conv: Optional[str] = None
         self._transfer_rows: Dict[str, int] = {}      # file_id -> row
+        # 传输速度/用时统计：file_id -> {start, bytes, at, speed}
+        self._transfer_stat: Dict[str, dict] = {}
         self._transfer_row_fid: Dict[int, str] = {}   # row -> file_id（双击定位用）
         self._transfer_paths: Dict[str, str] = {}     # file_id -> 本地路径（用于打开/预览）
         self._bubble_by_msg: Dict[str, tuple] = {}    # msg_id -> (气泡控件, 不含状态的正文)
@@ -173,10 +259,19 @@ class MainWindow(QMainWindow):
             ("发送文件", lambda: self._send_dialog(folder=False)),
             ("发送文件夹", lambda: self._send_dialog(folder=True)),
             ("手动添加 IP", self._manual_add),
+            ("配对选中设备", self._pair_selected),
+            ("刷新", self._refresh_all),
+            ("连接选中设备", self._connect_selected),
         ):
             btn = QPushButton(text)
             btn.clicked.connect(slot)
             row.addWidget(btn)
+        # 胶囊滑块开关：「保持长连接」（观感与手机端一致）
+        self.keepalive_btn = _PillSwitch("保持长连接")
+        self.keepalive_btn.setChecked(bool(self.engine.keep_alive()))
+        self.keepalive_btn.setToolTip("开启后：心跳更密、空闲不断开，长时间保持连接")
+        self.keepalive_btn.toggled.connect(self._toggle_keep_alive)
+        row.addWidget(self.keepalive_btn)
         layout.addLayout(row)
         return w
 
@@ -268,6 +363,10 @@ class MainWindow(QMainWindow):
         open_btn = QPushButton("打开选中的文件")
         open_btn.clicked.connect(self._open_selected_transfer)
         row.addWidget(open_btn)
+        exp_btn = QPushButton("导出到…")
+        exp_btn.setToolTip("把选中的文件另存到你自选的路径")
+        exp_btn.clicked.connect(self._export_selected_transfer)
+        row.addWidget(exp_btn)
         del_btn = QPushButton("删除文件")
         del_btn.clicked.connect(self._delete_selected_transfer)
         row.addWidget(del_btn)
@@ -304,34 +403,59 @@ class MainWindow(QMainWindow):
             ("打开", lambda: self._open_dir(self.cfg.data_dir)),
         ))
 
-        # 加密隧道口令
-        layout.addWidget(QLabel("— 加密隧道口令 —"))
-        pw_row = QHBoxLayout()
-        self.passphrase_edit = QLineEdit(self.engine.passphrase())
-        self.passphrase_edit.setEchoMode(QLineEdit.EchoMode.Password)   # 默认不显示口令
-        self.passphrase_edit.setAcceptDrops(False)   # 别让拖放把文件路径塞进口令框
-        self.passphrase_edit.setPlaceholderText("两端要一致；留空 = 不加密（明文）")
-        pw_row.addWidget(self.passphrase_edit, 1)
-        show_pw = QPushButton("显示")
-        show_pw.setCheckable(True)
-        show_pw.setToolTip("按住式切换：显示 / 隐藏口令")
-        show_pw.toggled.connect(
-            lambda on: (
-                self.passphrase_edit.setEchoMode(
-                    QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password),
-                show_pw.setText("隐藏" if on else "显示"),
-            )
+        # 已配对设备（v4：每设备独立身份 + 配对确认；**没有口令这个概念了**）
+        layout.addWidget(QLabel("— 已配对设备 —"))
+        self.paired_list = QListWidget()
+        self.paired_list.setMaximumHeight(120)
+        layout.addWidget(self.paired_list)
+        paired_row = QHBoxLayout()
+        unpair_btn = QPushButton("解绑选中设备")
+        unpair_btn.setToolTip("解绑后该设备下次连接需要重新配对")
+        unpair_btn.clicked.connect(self._unpair_selected)
+        paired_row.addWidget(unpair_btn)
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self._refresh_paired)
+        paired_row.addWidget(refresh_btn)
+        paired_row.addStretch(1)
+        layout.addLayout(paired_row)
+        paired_hint = QLabel(
+            "首次与某台设备连接时，两端会显示**同一个 6 位数字**；\n"
+            "核对一致后两边各点一次「配对」，才建立长期信任，直到你在这里解绑。\n"
+            "加密始终开启，不需要设置口令。"
         )
-        pw_row.addWidget(show_pw)
-        pw_save = QPushButton("保存口令")
-        pw_save.clicked.connect(self._save_passphrase)
-        pw_row.addWidget(pw_save)
-        layout.addLayout(pw_row)
-        pw_hint = QLabel("两端填同一个口令即可加密（会自动重连）。口令只在本机保存，不会显示在其它地方。")
-        pw_hint.setWordWrap(True)
-        layout.addWidget(pw_hint)
+        paired_hint.setWordWrap(True)
+        layout.addWidget(paired_hint)
 
         # 后台驻留：关窗口不退出（托盘常驻），这里可选开机自启
+        layout.addWidget(QLabel("— 连接时长 —"))
+        ct_row = QHBoxLayout()
+        ct_row.addWidget(QLabel("连接闲置多少分钟后自动关闭："))
+        self.conn_timeout_spin = QSpinBox()
+        self.conn_timeout_spin.setRange(1, 24 * 60)
+        self.conn_timeout_spin.setSuffix(" 分钟")
+        self.conn_timeout_spin.setValue(int(self.engine.conn_timeout_minutes()))
+        self.conn_timeout_spin.setToolTip("「保持长连接」打开时忽略此项（无限期保持）")
+        self.conn_timeout_spin.valueChanged.connect(
+            lambda v: self.engine.set_conn_timeout_minutes(int(v)))
+        ct_row.addWidget(self.conn_timeout_spin)
+        ct_row.addStretch(1)
+        layout.addLayout(ct_row)
+        layout.addWidget(QLabel("说明：连接空闲超过这个时间会被关闭（省资源）；"
+                                "打开「保持长连接」则**无限期保持**，不会被关。"))
+
+        cc_row = QHBoxLayout()
+        cc_row.addWidget(QLabel("TCP 并发（一次传输并发几条数据连接）："))
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 8)
+        self.concurrency_spin.setSuffix(" 条")
+        self.concurrency_spin.setValue(int(self.engine.concurrency()))
+        self.concurrency_spin.setToolTip("配合接口池：多设备/大文件时更快；填 1 = 单连接")
+        self.concurrency_spin.valueChanged.connect(
+            lambda v: self.engine.set_concurrency(int(v)))
+        cc_row.addWidget(self.concurrency_spin)
+        cc_row.addStretch(1)
+        layout.addLayout(cc_row)
+
         layout.addWidget(QLabel("— 后台驻留 —"))
         self.autostart_check = QCheckBox("开机自启动（登录后自动运行）")
         self.autostart_check.setChecked(load_prefs().get("autostart") == "1")
@@ -390,6 +514,7 @@ class MainWindow(QMainWindow):
         self._set_status("data", str(self.cfg.data_dir))
         self._refresh_peers_line()
         self._refresh_firewall_line()
+        self._refresh_paired()
 
     def _refresh_listen_line(self) -> None:
         transport = getattr(self.engine, "transport", None)
@@ -411,16 +536,15 @@ class MainWindow(QMainWindow):
         self._set_status("peers", f"发现 {len(peers)} 台 · 已连接 {connected} 台")
 
     def _refresh_tunnel_line(self) -> None:
-        """只显示加密状态 —— 不显示指纹等任何敏感信息。"""
+        """只显示加密状态 —— 不显示指纹等任何敏感信息。
+
+        v4 起加密**始终开启**（每设备独立身份），所以这一行恒为「已加密」。
+        """
         label = self._status_labels.get("tunnel")
         if label is None:
             return
-        if not self.engine.fingerprint():
-            label.setText("未加密（口令为空，同网段任何人都能与本机通信）")
-            label.setStyleSheet(f"color:{theme.GOLD};")
-        else:
-            label.setText("已加密")
-            label.setStyleSheet(f"color:{theme.GREEN};")
+        label.setText("已加密（强制 · 每设备独立身份）")
+        label.setStyleSheet(f"color:{theme.GREEN};")
 
     def _refresh_firewall_line(self) -> None:
         label = self._status_labels.get("firewall")
@@ -523,6 +647,8 @@ class MainWindow(QMainWindow):
         self.bridge.messageStatus.connect(self._on_message_status)
         self.bridge.transferEvent.connect(self._on_transfer)
         self.bridge.conversationRebound.connect(self._on_conv_rebound)
+        self.bridge.pairRequest.connect(self._on_pair_request)
+        self.bridge.pairedChanged.connect(self._on_paired_changed)
         self.bridge.log.connect(self._on_log)
 
     def _on_conv_rebound(self, old_id: str, new_id: str) -> None:
@@ -549,13 +675,42 @@ class MainWindow(QMainWindow):
             self.device_list.addItem(item)
         self._refresh_convs()
 
-    @staticmethod
-    def _peer_label(peer: Peer, connected: bool = True) -> str:
+    def _peer_label(self, peer: Peer, connected: bool = True) -> str:
+        """设备列表一行文字。
+
+        ⚠ **不要加 `@staticmethod`**：这里用了 `self.engine`，而调用方是 `self._peer_label(...)`。
+        标成 staticmethod 后 `self` 会被绑到第一个实参（Peer）上，`peer` 变成 bool →
+        一取属性就抛异常；而 `_refresh_nearby` 是「先 clear 再循环」，异常一抛附近页就永远是空的。
+        """
         kind = "手机" if peer.device_type == "android" else "电脑"
         state = "已连接" if connected else "未连接"
         dot = "●" if connected else "○"
         lock = "🔒 " if getattr(peer, "encrypted", False) else ""
-        return f"{dot} {lock}{peer.name}  [{kind}]  {peer.ip}  ·  {state}"
+        tag = ""
+        if getattr(peer, "incompatible", False):
+            tag = "  ⚠ 版本过旧，需升级"
+        elif not self.engine.is_paired(peer.device_id):
+            tag = "  ·  未配对"
+        return f"{dot} {lock}{peer.name}  [{kind}]  {peer.ip}  ·  {state}{tag}"
+
+    def _require_paired(self, peer_id: str) -> bool:
+        """未配对 / 版本过旧时**不允许**发业务数据，并给出明确提示。"""
+        peer = self.engine.get_peer(peer_id) or self._peers.get(peer_id)
+        if peer is not None and getattr(peer, "incompatible", False):
+            QMessageBox.warning(
+                self, "双方版本不一致",
+                "协议版本不一致，无法通信。\n\n请把两端都升级到最新版本再试。",
+            )
+            return False
+        if not self.engine.is_paired(peer_id):
+            QMessageBox.information(
+                self, "尚未配对",
+                f"与「{self._conv_display_name(peer_id)}」还没配对完成。\n\n"
+                "首次通信需要两端各自核对一次 **6 位数字**：\n"
+                "等配对窗口弹出后，确认两边数字相同再点「配对」。",
+            )
+            return False
+        return True
 
     def _tick(self) -> None:
         """定时刷新设备列表上的连接状态（连接建立/断开不产生事件）。"""
@@ -590,6 +745,66 @@ class MainWindow(QMainWindow):
         if ok and ip.strip():
             self.engine.add_manual_ip(ip.strip())
             self.statusBar().showMessage(f"已向 {ip.strip()} 发送探测", 5000)
+
+    def _connect_selected(self) -> None:
+        """**手动连接**选中的设备（退出再进软件后可手动连上；不自动连）。"""
+        peer = self._selected_peer()
+        if peer is None:
+            QMessageBox.information(self, "连接", "请先在设备列表里选中一台设备。")
+            return
+        if self.engine.is_connected(peer.device_id):
+            QMessageBox.information(self, "连接", f"「{peer.name}」已经连着了。")
+            return
+        self.statusBar().showMessage(f"正在连接「{peer.name}」…", 8000)
+
+        def work() -> None:
+            try:
+                ok, msg = self.engine.connect_by_ip(peer.ip, peer.tcp_port)
+            except Exception as exc:
+                ok, msg = False, f"连接异常：{exc}"
+            self.engine.bus.publish(EventType.LOG, msg or ("已连接" if ok else "连接失败"))
+
+        import threading
+
+        threading.Thread(target=work, name="manual-connect", daemon=True).start()
+
+    def _toggle_keep_alive(self, on: bool) -> None:
+        """开关「保持长连接」。"""
+        self.engine.set_keep_alive(on)
+        self.statusBar().showMessage(
+            "已开启「保持长连接」（心跳更密、空闲不断开）" if on else "已关闭「保持长连接」", 5000)
+
+    def _refresh_all(self) -> None:
+        """刷新：设备列表 + 设备状态（连接/未连接）+ 会话列表与预览 + 已配对设备。"""
+        self._refresh_nearby()     # 重建设备列表（含连接状态）
+        self._refresh_convs()      # 重建会话列表与预览
+        try:
+            self._refresh_paired() # 已配对设备
+        except Exception:
+            pass
+        self._tick()               # 立刻刷新连接状态文字
+
+    def _pair_selected(self) -> None:
+        """手动发起配对。
+
+        配对**失败后不会再自动重试**（否则会变成"疯狂发连接请求"）：
+        要让某台设备重新配对，就在设备列表里选中它、点这里手动发起一次。
+        """
+        peer = self._selected_peer()
+        if peer is None:
+            QMessageBox.information(self, "配对", "请先在设备列表里选中一台设备。")
+            return
+        if self.engine.is_paired(peer.device_id):
+            QMessageBox.information(self, "配对", f"「{peer.name}」已经配对过了。")
+            return
+        if self.engine.request_pairing(peer.device_id):
+            self.statusBar().showMessage(
+                f"已向「{peer.name}」发起配对：核对两边显示的 6 位数字一致后点「配对」。", 8000)
+        else:
+            QMessageBox.warning(
+                self, "配对",
+                f"暂时连不上「{peer.name}」。\n请确认在同一局域网/热点下，稍后再试。",
+            )
 
     # ------------------------------------------------------------- 会话
     def _refresh_convs(self) -> None:
@@ -639,7 +854,9 @@ class MainWindow(QMainWindow):
         self.engine.touch_conversation(peer_id, peer.name if peer else None)
         self.chat_title.setText(f"与 {self._conv_display_name(peer_id)} 的会话")
         self._clear_chat()
+        self._chat_seen_ids = set()          # 这一段会话已渲染过的消息（用于幂等，防重复气泡）
         for msg in self.engine.history(peer_id):
+            self._chat_seen_ids.add(msg.msg_id)
             self._render_message(msg)
         self._refresh_convs()
 
@@ -810,6 +1027,8 @@ class MainWindow(QMainWindow):
             if not self._current_conv:
                 QMessageBox.information(self, "提示", "请先选择会话。")
             return
+        if not self._require_paired(self._current_conv):
+            return
         self.input.clear()
         msg = self.engine.send_text(self._current_conv, text)
         if msg is not None:
@@ -848,14 +1067,37 @@ class MainWindow(QMainWindow):
             files, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件", "", filt)
             paths = files
         if paths:
+            if not self._require_paired(peer_id):
+                return
             self.engine.send_files(peer_id, paths)
+        # 发送后**立刻刷新聊天框**：文件/图片气泡（含进度）当场出现，不用去传输页
+        if self._current_conv == peer_id:
+            try:
+                self._select_conv(peer_id)
+            except Exception:
+                pass
+            # 发送后**立刻刷新聊天框**：文件/图片气泡（含进度）当场出现，不用去传输页
+            if self._current_conv == peer_id:
+                try:
+                    self._select_conv(peer_id)
+                except Exception:
+                    pass
 
     def _on_message(self, msg: ChatMessage) -> None:
-        if msg.outgoing:
-            # 出站消息已在 _send_text 里渲染，这里避免重复
+        if msg.outgoing and msg.kind == MsgKind.TEXT:
+            # 出站**文本**已在 _send_text 里渲染，这里避免重复；
+            # 出站的文件/图片没有别处画 → 必须走下面渲染，否则"自己发的自己看不到"
             return
         if msg.conv_id == self._current_conv:
-            self._render_message(msg)
+            # ⚠ **幂等**：同一条（msg_id）只画一次。
+            # 否则「传输完成 → 重画整段聊天」和随后的 MESSAGE 事件会各画一次 → 一模一样两条。
+            seen = getattr(self, "_chat_seen_ids", None)
+            if seen is None:
+                seen = set()
+                self._chat_seen_ids = seen
+            if msg.msg_id not in seen:
+                seen.add(msg.msg_id)
+                self._render_message(msg)
         peer = self._peers.get(msg.conv_id)
         name = peer.name if peer else self._conv_display_name(msg.conv_id)
         viewing = self.isVisible() and self.isActiveWindow() and msg.conv_id == self._current_conv
@@ -987,6 +1229,26 @@ class MainWindow(QMainWindow):
             return
         self._open_transfer_path(fid)
 
+    def _export_selected_transfer(self) -> None:
+        """把选中的传输文件**导出到你自选的路径**。"""
+        import shutil
+        from pathlib import Path as _P
+
+        row = self.transfer_table.currentRow()
+        fid = self._transfer_row_fid.get(row) if row >= 0 else None
+        src = self._transfer_paths.get(fid) if fid else None
+        if not src or not _P(src).is_file():
+            QMessageBox.information(self, "导出", "请先选中一条**有本地文件**的记录。")
+            return
+        dst, _ = QFileDialog.getSaveFileName(self, "导出到…", _P(src).name)
+        if not dst:
+            return
+        try:
+            shutil.copy2(src, dst)
+            self.statusBar().showMessage(f"已导出到 {dst}", 8000)
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+
     def _delete_selected_transfer(self) -> None:
         row = self.transfer_table.currentRow()
         fid = self._transfer_row_fid.get(row) if row >= 0 else None
@@ -1013,6 +1275,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 5000)
 
     def _remove_transfer_row(self, fid: str) -> None:
+        self._transfer_stat.pop(fid, None)
         row = self._transfer_rows.pop(fid, None)
         self._transfer_paths.pop(fid, None)
         if row is None or row >= self.transfer_table.rowCount():
@@ -1108,12 +1371,37 @@ class MainWindow(QMainWindow):
         state_text = _STATE_TEXT.get(t.state, str(t.state))
         if t.error:
             state_text = f"{state_text} · {t.error}"
+        # 速度 + 用时：首次见到该任务记开始时间；用**增量**算瞬时速度（每 ~0.4s 刷新一次）
+        import time as _time
+
+        _now = _time.time()
+        _st = self._transfer_stat.setdefault(
+            fid, {"start": _now, "bytes": 0, "at": _now, "speed": 0.0}
+        )
+        if t.state in (TransferState.COMPLETED, TransferState.FAILED):
+            _st["speed"] = 0.0
+        else:
+            _dt = _now - _st["at"]
+            if _dt >= 0.4:
+                _st["speed"] = max(0.0, (done - _st["bytes"]) / _dt)
+                _st["bytes"], _st["at"] = done, _now
+        _elapsed = max(0.0, _now - _st["start"])
+        _mm, _ss = divmod(int(_elapsed), 60)
+        _speed_txt = f"{human_size(int(_st['speed']))}/s" if _st["speed"] > 0 else "—"
+        state_text = f"{state_text} · {_speed_txt} · {_mm:02d}:{_ss:02d}"
         self.transfer_table.setItem(row, 5, QTableWidgetItem(state_text))
         # 发出的图片用本地原文件预览，收到的用落盘文件预览
         path = t.final_path or t.local_path
         if path:
             self._transfer_paths[fid] = path
             self.transfer_table.setItem(row, 6, QTableWidgetItem("双击打开"))
+        # 传输**完成** → 后端已在会话里补了一条文件/图片消息；刷新聊天框，
+        # 让它像普通消息一样立刻出现（收发两端都会补，所以两边都能看到）。
+        if t.state == TransferState.COMPLETED and self._current_conv == t.peer_id:
+            try:
+                self._select_conv(t.peer_id)
+            except Exception:
+                pass
         if t.state in (TransferState.COMPLETED, TransferState.FAILED):
             key = f"{fid}:{t.state}"
             if notify and key not in self._transfer_notified:
@@ -1170,11 +1458,56 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------- 设置
-    def _save_passphrase(self) -> None:
-        self.engine.set_passphrase(self.passphrase_edit.text())
-        self.passphrase_edit.setText(self.engine.passphrase())
-        self._refresh_tunnel_line()
-        self._warned_no_conn = False
+    # ------------------------------------------------------------- 配对（v4）
+    def _on_pair_request(self, data) -> None:
+        """后端问「要不要跟这台设备配对」→ 弹窗让用户核对 6 位码。"""
+        peer_id = str(data.get("peer_id") or "")
+        if not peer_id:
+            return
+        name = str(data.get("name") or peer_id[:8])
+        sas = str(data.get("sas") or "")
+        accepted = PairingDialog(name, sas, self).exec() == QDialog.DialogCode.Accepted
+        # 回答后端（它正在等这个答案；超时/取消都算拒绝）
+        self.engine.answer_pairing(peer_id, accepted)
+        self.statusBar().showMessage(
+            f"已确认与「{name}」配对" if accepted else f"已取消与「{name}」的配对", 5000
+        )
+        self._refresh_paired()
+
+    def _on_paired_changed(self, _data) -> None:
+        self._refresh_paired()
+        self._refresh_nearby()
+
+    def _refresh_paired(self) -> None:
+        """刷新设置页的「已配对设备」列表。"""
+        if not hasattr(self, "paired_list"):
+            return
+        self.paired_list.clear()
+        for row in self.engine.paired_devices():
+            did = str(row.get("device_id") or "")
+            item = QListWidgetItem(row.get("name") or did[:8])
+            item.setData(Qt.UserRole, did)
+            item.setToolTip("已配对：对方身份已被记住。解绑后需重新配对。")
+            self.paired_list.addItem(item)
+
+    def _unpair_selected(self) -> None:
+        item = self.paired_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "解绑", "请先在列表里选中一台设备。")
+            return
+        peer_id = item.data(Qt.UserRole)
+        if not peer_id:
+            return
+        if QMessageBox.question(
+            self,
+            "解绑设备",
+            f"解绑「{item.text()}」？\n\n解绑后它下次连接要重新配对（重新核对 6 位数字）。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self.engine.unpair(peer_id)
+        self._refresh_paired()
         self._refresh_nearby()
 
     # ------------------------------------------------------------- 开机自启
@@ -1419,6 +1752,8 @@ class MainWindow(QMainWindow):
                 "还没发现任何设备。请确认两台设备在同一局域网/热点下，\n"
                 "或在「设置」里手动添加对方 IP。",
             )
+            return
+        if not self._require_paired(peer_id):
             return
 
         self.engine.send_files(peer_id, paths)

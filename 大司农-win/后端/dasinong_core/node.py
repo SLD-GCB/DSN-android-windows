@@ -5,9 +5,9 @@ UI 只与本类交互；事件通过 EventBus 发布。
 from __future__ import annotations
 
 import json
-import os
 import random
 import threading
+import os
 import time
 import uuid
 from dataclasses import replace
@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import Config, load_prefs, save_prefs
+
+#: 「保持长连接」模式：心跳更密、容忍更久的无响应（空闲也不剪会话）
+KEEPALIVE_PING = 2.0
+KEEPALIVE_TIMEOUT = 60.0
 from .events import EventBus, EventType
 from .models import ChatMessage, FileEntry, MsgKind, Peer, PeerState, Transfer, TransferState
 from .network.tunnel import Tunnel
@@ -24,7 +28,10 @@ from .network.control import ControlSession, TransportManager
 from .network.discovery import DiscoveryService
 from .network.gateway_rendezvous import GatewayRendezvous
 from .network.transfer import TransferManager
+from .pairing import PairingManager, sas_code
 from .protocol import messages
+from .security import SecretStore, get_secret_store
+from .security.identity import KEY_FILE, load_or_create
 from .protocol.constants import (
     PEER_TIMEOUT,
     PING_INTERVAL,
@@ -55,8 +62,22 @@ class NodeEngine:
         self.cfg = cfg
         self.bus = bus or EventBus()
 
-        # 隧道（口令）：环境变量优先，其次 SQLite 设置；空口令 = 不加密
-        self.tunnel = Tunnel(self._passphrase_from_env())
+        # 敏感数据的静态加密存储（Windows=DPAPI；其它平台降级为明文）
+        self._secret: SecretStore = get_secret_store()
+
+        # 本机**长期身份**（v4：每设备随机，不再是口令派生）。
+        # 原身份解不开（换机/清数据/换 Windows 用户）时会生成新的 —— 对端需重新配对。
+        identity_path = Path(cfg.data_dir) / KEY_FILE
+        had_identity = identity_path.exists()
+        self.identity, identity_reused = load_or_create(cfg.data_dir, self._secret)
+        self.tunnel = Tunnel(self.identity)
+        if had_identity and not identity_reused:
+            self.bus.publish(
+                EventType.LOG, "本机身份已重新生成（原身份丢失），对端需要重新配对"
+            )
+
+        # 配对：首次连接要人工确认（两端显示同一个 6 位短码），之后长期信任
+        self.pairing = PairingManager(self.bus)
 
         self.discovery = DiscoveryService(
             cfg, self.bus, gateway_enabled=True, tunnel_provider=lambda: self.tunnel
@@ -77,6 +98,17 @@ class NodeEngine:
         self.store = None      # 由 attach_store 注入
 
         self._stop = threading.Event()
+        #: 「TCP 并发」（1~8，落盘）
+        self._concurrency = max(1, min(8, int(load_prefs().get("tcp_concurrency") or 3)))
+        #: 连接闲置多久自动关闭（分钟，落盘）
+        self._conn_timeout_min = int(load_prefs().get("conn_timeout_min") or 10)
+        #: 「保持长连接」开关（落盘，重启后保持）
+        self._keep_alive = load_prefs().get("keep_alive") == "1"
+        #: 探网关是否正在进行（防重入叠加）
+        self._gw_probing = False
+        #: 上次「直连网关做发现」的时间（节流）。
+        #: ⚠ 初值取「现在」：启动后先等一个间隔再探，避免刚起来就与控制连接抢 transport。
+        self._gw_discover_at = time.time()
         self._maintenance_thread: Optional[threading.Thread] = None
 
         self._seen_text: "OrderedDict[str, bool]" = OrderedDict()
@@ -86,6 +118,10 @@ class NodeEngine:
         # 下次启动可以直接拨回去，不必每次手输 IP。
         self._known_peers: Dict[str, dict] = self._load_known_peers()
         self._attempts: Dict[str, int] = {}
+        #: peer_id -> 上次"配对没成"的时间。防止「拒绝→断线→重连→再问」形成重连风暴。
+        #: 配对失败过的对端：不再**自动**发起配对，等用户手动点「配对」。
+        #: （只做时间冷却不够 —— 冷却一过又会自动重连→重问，表现为"疯狂发连接请求"。）
+        self._pair_blocked: set = set()
         self._no_session_since: Dict[str, float] = {}
         self._last_ping: Dict[str, float] = {}
         self._outbox: List[tuple] = []
@@ -96,9 +132,22 @@ class NodeEngine:
 
     # ------------------------------------------------------------- 生命周期
     def start(self) -> None:
+        """启动各子系统。
+
+        **强制加密**：没设口令就**什么都不启**（不监听、不广播）——否则等于把明文
+        服务默认暴露在同网段里。用户在「设置」里设好口令后重启引擎即可。
+        """
+        self.start_errors = []
+        if not self.is_encrypted():
+            msg = (
+                "未设置隧道口令 —— 为安全起见已停用网络功能。"
+                "请在「设置 → 加密隧道口令」里设置口令后重试。"
+            )
+            self.start_errors.append(msg)
+            self.bus.publish(EventType.LOG, msg)
+            return
         # 逐个启动，任何一个失败都不影响其余子系统（否则会表现为
         # 「能发现设备但永远建不起 TCP 连接」）。
-        self.start_errors = []
         steps = (
             ("发现服务", self.discovery.start),
             ("网关中继", self.gateway.start),
@@ -174,6 +223,8 @@ class NodeEngine:
         self._endpoints[peer.device_id] = (peer, time.time() if now is None else now)
 
     # ------------------------------------------------------------- 已知设备记忆
+        # 启动即把设置里的「TCP 并发」写进传输引擎
+        self.transfer.parallel = self._concurrency
     @staticmethod
     def _load_known_peers() -> Dict[str, dict]:
         try:
@@ -209,8 +260,92 @@ class NodeEngine:
         return self.transport.get_session(device_id) is not None
 
     def add_manual_ip(self, ip: str) -> None:
-        self.discovery.add_manual_target(ip)
-        self.gateway.add_candidate(ip)
+        """手动添加/连接一个 IP：**优先 socket 直连（TCP）**，UDP 只作补充。
+
+        为什么先走 TCP：手机当热点主机时它的 UDP 广播发不出来，等 UDP 回包会永远等不到；
+        TCP 直连不依赖广播，热点下才连得上。连上即把对端登记进发现表（附近页随之出现）。
+        """
+        clean = (ip or "").strip()
+        if not clean:
+            return
+        self.discovery.add_manual_target(clean)     # 同网段普通 WiFi：UDP 探测仍有用
+        self.gateway.add_candidate(clean)
+        # socket 直连放后台线程，别卡住界面
+        threading.Thread(
+            target=self._direct_connect_to, args=(clean,), name="manual-direct", daemon=True
+        ).start()
+
+
+    #: 「直连网关做发现」的重试间隔（秒）。
+    _GW_DISCOVER_INTERVAL = 8.0
+
+    def _auto_discover_gateway(self, now: float) -> None:
+        """**自动发现**兜底：TCP 直连默认网关（热点主机）把对方登记进发现表。
+
+        为什么需要：热点主机（手机）的 UDP 广播发不出来（安卓 `candidateLans()` 只认
+        WIFI/ETHERNET，热点网卡被过滤）→ 客户端（电脑）永远收不到 → 附近列表空。
+        这里让客户端**主动 TCP 直连网关**问一句"你是谁"，连上即登记 → 附近列表出现。
+
+        ⚠ **只做发现**：不自动配对、不自动触发配对请求；连不连、配不配仍由用户手动点。
+        """
+        if self.discovery.snapshot():
+            return                              # 已经发现有设备了，不必再探
+        if self.transport.sessions():
+            return                              # 已有会话，不必再探
+        if self._gw_probing:
+            return                              # 上一次还在探 → 别叠加（防重入/刷屏）
+        if now - self._gw_discover_at < self._GW_DISCOVER_INTERVAL:
+            return
+        self._gw_discover_at = now
+        self._gw_probing = True
+        from .network import interfaces as ifaces_mod
+        gw = ifaces_mod.default_gateway()
+        if not gw:
+            return
+        def _probe() -> None:
+            try:
+                self._direct_connect_to(gw)
+            finally:
+                self._gw_probing = False
+
+        threading.Thread(target=_probe, name="gw-discover", daemon=True).start()
+
+    def _direct_connect_to(self, ip: str) -> bool:
+        """**socket 直连**一个 IP（不依赖 UDP 广播）：连上就把对端登记进发现表。
+
+        手动"添加 IP"与自动"发现网关"都走这一条。
+        """
+        try:
+            sess, info, err = self.transport.connect_direct(ip, self.cfg.tcp_port, timeout=4.0)
+        except Exception as exc:
+            self.bus.publish(EventType.LOG, f"直连 {ip} 失败：{exc}")
+            return False
+        if sess is None:
+            self.bus.publish(EventType.LOG, f"直连 {ip} 失败：{err or '无响应'}")
+            return False
+        info = info or {}
+        did = str(info.get("device_id") or sess.peer_id or "")
+        if not did or did == self.cfg.device_id:
+            return False
+        peer = Peer(
+            device_id=did,
+            name=info.get("name") or did[:8],
+            ip=ip,
+            tcp_port=int(info.get("tcp_port") or self.cfg.tcp_port),
+            udp_port=int(info.get("udp_port") or self.cfg.udp_port),
+            device_type=info.get("device_type") or "unknown",
+            proto=int(info.get("proto") or 1),
+            encrypted=True,
+            state=PeerState.ONLINE,
+        )
+        self._remember_endpoint(peer)
+        self._remember_peer(peer)
+        try:
+            self.discovery.register_peer(peer)
+        except Exception:
+            pass
+        self.bus.publish(EventType.LOG, f"已直连 {peer.name}（{ip}）")
+        return True
 
     # ------------------------------------------------------------- 诊断
     def diagnose_peer(self, peer_id: str) -> str:
@@ -285,43 +420,161 @@ class NodeEngine:
         self.bus.publish(EventType.LOG, f"数据目录已设为：{target}（重启后生效）")
         return target
 
-    # ------------------------------------------------------------- 隧道 / 口令
-    @staticmethod
-    def _passphrase_from_env() -> str:
-        return os.environ.get("DASINONG_PASSPHRASE", "") or ""
-
-    def passphrase(self) -> str:
-        return self.tunnel.passphrase
-
+    # ------------------------------------------------------------- 身份 / 配对
     def fingerprint(self) -> str:
-        """本机隧道公钥指纹（口令为空则空串）。供人工核对。"""
-        return self.tunnel.fingerprint
+        """本机身份公钥指纹。⚠ **不要显示到界面上**（用户硬要求）。"""
+        return self.identity.fingerprint
 
     def is_encrypted(self) -> bool:
-        return bool(self.tunnel.enabled)
+        """v4 起恒为 True：身份是本机必需的，不存在"没加密"的运行模式。"""
+        return True
 
-    def set_passphrase(self, value: str) -> None:
-        """设置/清除隧道口令：重建身份与 TLS 上下文，并断开旧会话用新口令重连。"""
-        value = (value or "").strip()
-        if value == self.tunnel.passphrase:
-            return
-        old = self.tunnel
-        self.tunnel = Tunnel(value)
-        old.close()
+    # ---- 配对表 ----
+    def paired_devices(self) -> List[dict]:
+        return self.store.pair_all() if self.store is not None else []
+
+    def is_paired(self, peer_id: str) -> bool:
+        if self.store is None:
+            return False
+        row = self.store.pair_get(peer_id)
+        return bool(row) and bool(row.get("trusted"))
+
+    def unpair(self, peer_id: str) -> None:
+        """解绑：删掉信任记录并断开当前会话（下次连接需重新配对）。"""
         if self.store is not None:
-            try:
-                self.store.setting_set("passphrase", value)
-            except Exception:
-                pass
+            self.store.pair_remove(peer_id)
         for sess in list(self.transport.sessions()):
+            if sess.peer_id == peer_id:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+        self.bus.publish(EventType.PAIRED_CHANGED, {"peer_id": peer_id, "paired": False})
+        self.bus.publish(EventType.LOG, f"已解绑 {self._peer_name(peer_id) or peer_id[:8]}")
+
+    def answer_pairing(self, peer_id: str, accept: bool) -> None:
+        """UI 回答「是否与这台设备配对」（配对弹窗的按钮回调）。"""
+        self.pairing.answer(peer_id, accept)
+
+    # ---- 配对流程：未配对时首次连接走一遍 ----
+    def _pair_state(self, sess: ControlSession) -> bool:
+        """懒判定该会话是否已配对；顺带发现"对方换了身份"。"""
+        if self.store is None or not sess.peer_fp:
+            return bool(sess.paired)
+        row = self.store.pair_get(sess.peer_id)
+        if row is None:
+            return bool(sess.paired)
+        if str(row.get("fp") or "") != sess.peer_fp:
+            if not getattr(sess, "_identity_warned", False):
+                sess._identity_warned = True
+                self.bus.publish(
+                    EventType.LOG, "对方身份已变更（可能重装/换机），需要重新配对"
+                )
+            sess.paired = False
+            return False
+        sess.paired = True
+        return True
+
+    def _begin_pairing(self, sess: ControlSession) -> None:
+        """由**拨号方**发起配对：先发 `pair_request`，同时在后台问本端用户。
+
+        只有**首次**（没失败过）才自动发起；一旦失败，该对端进入 `_pair_blocked`，
+        不再自动询问，等用户在界面上手动点「配对」（`request_pairing`）。
+        """
+        if self._pair_state(sess):
+            return
+        if sess.peer_id in self._pair_blocked:
+            return  # 之前配对失败过：不再自动发起，等用户手动
+        try:
+            sess.send(messages.envelope(
+                "pair_request", self.cfg.device_id, sess.peer_id,
+                {"name": self.cfg.device_name},
+            ))
+        except Exception:
+            return
+        sas = sas_code(sess.peer_fp, self.identity.fingerprint, sess.peer_nonce)
+        name = self._peer_name(sess.peer_id) or sess.peer_id[:8]
+
+        def worker() -> None:
+            ok = self.pairing.ask(sess.peer_id, name, sas)
             try:
-                sess.close()
+                sess.send(messages.envelope(
+                    "pair_accept" if ok else "pair_reject", self.cfg.device_id, sess.peer_id, {}))
             except Exception:
-                pass
-        self.bus.publish(
-            EventType.LOG,
-            "隧道口令已更新，正在用新口令重连" if value else "已关闭加密（口令为空）",
-        )
+                return
+            sess.pair_own_ok = ok
+            if ok:
+                self._finish_pairing(sess, name)
+            else:
+                self._block_pairing(sess.peer_id)
+                self.bus.publish(EventType.LOG, f"与 {name} 的配对未完成（可在「附近设备」里手动点「配对」）")
+
+        threading.Thread(target=worker, name="pair-ask", daemon=True).start()
+
+    def _on_pair_request(self, sess: ControlSession, env: dict) -> None:
+        """被叫方收到配对请求：算短码 → 问本端用户 → 回 accept/reject。"""
+        data = env.get("data") or {}
+        name = str(data.get("name") or "") or (self._peer_name(sess.peer_id) or sess.peer_id[:8])
+        sas = sas_code(sess.peer_fp, self.identity.fingerprint, sess.peer_nonce)
+        ok = self.pairing.ask(sess.peer_id, name, sas)
+        try:
+            sess.send(messages.envelope(
+                "pair_accept" if ok else "pair_reject", self.cfg.device_id, sess.peer_id, {}))
+        except Exception:
+            return
+        sess.pair_own_ok = ok
+        if ok:
+            self._finish_pairing(sess, name)
+        else:
+            self.bus.publish(EventType.LOG, "已取消配对")
+
+    def _block_pairing(self, peer_id: str) -> None:
+        """配对没成：不再自动发起，并让维护循环慢下来（避免「拒绝→重连→再问」风暴）。"""
+        self._pair_blocked.add(peer_id)
+        self._backoff_until[peer_id] = time.time() + 30.0
+
+    def request_pairing(self, peer_id: str) -> bool:
+        """**手动**发起/重试配对（界面「配对」按钮调用）。
+
+        清掉失败标记和退避，尽量在当前会话上立刻问；没有连接就先连一次。
+        返回 False 表示暂时连不上该设备。
+        """
+        self._pair_blocked.discard(peer_id)
+        self._backoff_until.pop(peer_id, None)
+        sess = self.transport.get_session(peer_id)
+        if sess is None:
+            peer = self.discovery.get(peer_id)
+            if peer is not None:
+                try:
+                    self.transport.connect_control(peer.ip, peer_id, peer.tcp_port)
+                except Exception:
+                    pass
+                sess = self.transport.get_session(peer_id)
+        if sess is None:
+            return False
+        self._begin_pairing(sess)
+        return True
+
+    def _finish_pairing(self, sess: ControlSession, name: str = "") -> None:
+        """**两端都同意**后才落库（不产生"半信任"）。"""
+        if sess.paired or not (sess.pair_own_ok and sess.pair_peer_ok) or self.store is None:
+            return
+        label = name or self._peer_name(sess.peer_id) or sess.peer_id[:8]
+        try:
+            self.store.pair_upsert(sess.peer_id, sess.peer_fp, label)
+        except Exception as exc:
+            self.bus.publish(EventType.LOG, f"保存配对失败：{exc}")
+            return
+        sess.paired = True
+        try:
+            sess.send(messages.envelope(
+                "pair_ok", self.cfg.device_id, sess.peer_id,
+                {"fp": self.identity.fingerprint},
+            ))
+        except Exception:
+            pass
+        self.bus.publish(EventType.PAIRED_CHANGED, {"peer_id": sess.peer_id, "paired": True})
+        self.bus.publish(EventType.LOG, f"已与 {label} 配对")
 
     # ------------------------------------------------------------- 持久化
     def attach_store(self, store) -> None:
@@ -334,14 +587,7 @@ class NodeEngine:
         # 设备被发现后，把手动 IP 会话升级成真实 device_id
         self.bus.subscribe(self._on_peer_for_bind, EventType.PEER_ADDED)
         self.bus.subscribe(self._on_peer_for_bind, EventType.PEER_UPDATED)
-        # 环境变量没给口令时，用上次保存的
-        if not self._passphrase_from_env():
-            try:
-                saved = store.setting_get("passphrase", "") or ""
-            except Exception:
-                saved = ""
-            if saved and saved != self.tunnel.passphrase:
-                self.set_passphrase(saved)
+        # 注：v4 起没有"口令"要恢复了 —— 身份是每设备随机的，配对表在库里持久化。
 
     def _persist_transfer_event(self, event) -> None:
         if self.store is None or not isinstance(event.data, Transfer):
@@ -352,21 +598,29 @@ class NodeEngine:
             pass
 
     def _on_transfer_for_chat(self, event) -> None:
-        """接收完成 → 在会话里生成一条 file/image 消息（带本地落盘路径，UI 可直接显示缩略图）。"""
+        """传输完成 → 在会话里生成一条 file/image 消息。
+
+        **收发两端都要生成**（和文本消息一样）：
+        - 接收：用**落盘路径**（final_path），UI 能直接出缩略图；
+        - 发送：用**本地原文件路径**（local_path），自己那一侧也要能看到自己发的。
+        """
         t = event.data
-        if not isinstance(t, Transfer) or t.direction != "recv" or t.state != TransferState.COMPLETED:
+        if not isinstance(t, Transfer) or t.state != TransferState.COMPLETED:
+            return
+        if t.direction not in ("send", "recv"):
             return
         f = t.file
         if f is None or f.file_id in self._chat_notified:
             return
         self._chat_notified.add(f.file_id)
-        entry = replace(f, local_path=t.final_path or f.local_path)
+        sending = t.direction == "send"
+        entry = f if sending else replace(f, local_path=t.final_path or f.local_path)
         msg = ChatMessage(
             msg_id=str(uuid.uuid4()),
             conv_id=t.peer_id,
             kind=MsgKind.IMAGE if entry.kind == "image" else MsgKind.FILE,
-            outgoing=False,
-            status="received",
+            outgoing=sending,
+            status="sent" if sending else "received",
             transfer_id=t.transfer_id,
             file=entry,
         )
@@ -514,6 +768,16 @@ class NodeEngine:
                         self.discovery.register_peer(peer)
                     except Exception:
                         pass
+                # 配对**手动**：连上 ≠ 配对，用户要配对时自己在界面上点「配对」。
+                # 唯一例外：无头自测（DASINONG_PAIR_AUTO=1，真实运行绝不设置）没人点按钮，
+                # 自动发起一次，否则集成用例永远配不上、业务帧全被拒。
+                if os.environ.get("DASINONG_PAIR_AUTO") == "1":
+                    s0 = self.transport.get_session(peer.device_id)
+                    if s0 is not None:
+                        try:
+                            self._begin_pairing(s0)
+                        except Exception:
+                            pass
                 return True, f"已连接 {peer.name}"
             return False, f"连不上 {peer.name}（{clean}）"
         sess, info, err = self.transport.connect_direct(clean, port, timeout)
@@ -521,11 +785,15 @@ class NodeEngine:
             return False, err or "直连失败"
         info = info or {}
         encrypted = bool(self.tunnel is not None and getattr(self.tunnel, "enabled", False))
+        # 接口池：对端在 connect_ok 里通告了**给本机的专属口**（tcp_ports）→ 记下来，
+        # 之后本机发起的连接（数据连接/重连）都走这个口；没有则回落主口 tcp_port。
+        _ports = info.get("tcp_ports") or []
+        _dial_port = int(_ports[0]) if _ports else int(info.get("tcp_port") or self.cfg.tcp_port)
         peer = Peer(
             device_id=info.get("device_id") or sess.peer_id,
             name=info.get("name") or (info.get("device_id") or sess.peer_id)[:8],
             ip=clean,
-            tcp_port=int(info.get("tcp_port") or self.cfg.tcp_port),
+            tcp_port=_dial_port,
             udp_port=int(info.get("udp_port") or self.cfg.udp_port),
             device_type=info.get("device_type") or "unknown",
             proto=int(info.get("proto") or 1),
@@ -538,6 +806,13 @@ class NodeEngine:
             self.discovery.register_peer(peer)      # 发 PEER_ADDED → ip: 会话自动升级
         except Exception:
             pass
+        # 配对**手动**：直连只建立连接；要不要配对由用户自己点「配对」。
+        # 例外同上：仅无头自测（DASINONG_PAIR_AUTO=1）才自动发起。
+        if os.environ.get("DASINONG_PAIR_AUTO") == "1":
+            try:
+                self._begin_pairing(sess)
+            except Exception:
+                pass
         self.bus.publish(EventType.LOG, f"已直连 {peer.name}（{clean}）")
         return True, f"已直连 {peer.name}"
 
@@ -549,6 +824,15 @@ class NodeEngine:
         self._backoff_until.pop(peer_id, None)
         self._attempts.pop(peer_id, None)
         self._no_session_since[peer_id] = 0.0    # 立刻允许兜底反连
+        # **按需补连**：发送方（发消息/发文件）要用连接但没有 → 立刻拨一次。
+        # 这是"用户主动发送"触发的，不是后台循环，所以不会撞接口。
+        if self.transport.get_session(peer_id) is None:
+            peer = self.discovery.get(peer_id) or self.get_peer(peer_id)
+            if peer is not None:
+                try:
+                    self.transport.connect_control(peer.ip, peer_id, peer.tcp_port)
+                except Exception:
+                    pass
 
     def _learn_incoming_peer(self, info: dict, ip: str) -> None:
         """把「主动连进来」的对端登记进发现表 + 端点缓存。
@@ -850,11 +1134,38 @@ class NodeEngine:
     def _on_control(self, sess: ControlSession, env: dict) -> None:
         mtype = env.get("type")
         peer_id = sess.peer_id
+        # ---- 配对协商（任何一侧都可能发）----
+        if mtype == "pair_request":
+            self._on_pair_request(sess, env)
+            return
+        if mtype == "pair_accept":
+            sess.pair_peer_ok = True
+            self._finish_pairing(sess)
+            return
+        if mtype == "pair_reject":
+            self._block_pairing(peer_id)
+            self.bus.publish(EventType.LOG, "对方拒绝了配对（可在「附近设备」里手动点「配对」重试）")
+            return
+        if mtype == "pair_ok":
+            sess.pair_peer_ok = True
+            self._finish_pairing(sess)
+            return
+        # ---- 保活（配对前也允许）----
         if mtype == "ping":
             sess.send(messages.envelope("pong", self.cfg.device_id, peer_id, {}))
             return
         if mtype == "pong":
             sess.last_pong = time.time()
+            return
+        # ---- 未配对闸门：除保活/配对外，业务帧一律拒绝 ----
+        if not self._pair_state(sess):
+            try:
+                sess.send(messages.envelope(
+                    "error", self.cfg.device_id, peer_id,
+                    {"code": "unpaired", "message": "尚未配对：请先在对端确认配对"},
+                ))
+            except Exception:
+                pass
             return
         if mtype == "text":
             self._on_text(env, peer_id)
@@ -884,6 +1195,7 @@ class NodeEngine:
         while not self._stop.is_set():
             now = time.time()
             self._ensure_sessions(now)
+            self._auto_discover_gateway(now)   # 自动发现（只登记，不配对）
             self._ping_sessions(now)
             self._flush_outbox()
             try:
@@ -920,6 +1232,9 @@ class NodeEngine:
                 continue
         for peer in peers:
             pid = peer.device_id
+            if getattr(peer, "incompatible", False):
+                # 版本协商不通过：能看见但不拨号，避免白发连接与一堆失败日志
+                continue
             remember = False
             sess = self.transport.get_session(pid)
             if sess is not None:
@@ -948,37 +1263,73 @@ class NodeEngine:
                 self._attempts.pop(pid, None)
                 self._backoff_until.pop(pid, None)
                 self._no_session_since.pop(pid, None)
-            else:
-                if now < self._backoff_until.get(pid, 0.0):
-                    continue
-                # 首选由 device_id 较小的一方发起（两端都连时也是它胜出）；
-                # 但若等待 _FALLBACK_DELAY 秒仍无连接，另一侧也主动兜底反连，
-                # 否则一旦“首选方向”被防火墙/路由挡住就永远连不上。
-                since = self._no_session_since.setdefault(pid, now)
-                is_canon = self.cfg.device_id < pid
-                if not is_canon and now - since < _FALLBACK_DELAY:
-                    continue
-                sess = self.transport.connect_control(peer.ip, pid, peer.tcp_port)
-                if sess is None:
-                    n = self._attempts.get(pid, 0) + 1
-                    self._attempts[pid] = n
-                    delay = RECONNECT_BACKOFF[min(n - 1, len(RECONNECT_BACKOFF) - 1)]
-                    delay *= 1 + random.uniform(-RECONNECT_JITTER, RECONNECT_JITTER)
-                    # 只在「记忆里」而不在发现表里的对端：放慢重试，避免在别的网络里空拨
-                    if self.discovery.get(pid) is None:
-                        delay *= 4
-                    self._backoff_until[pid] = now + delay
-                else:
-                    remember = True
+            # ⚠ **不做任何自动重连**：闲置关闭时长由设置页的「连接闲置多久后关闭」决定，
+            # 「保持长连接」= 无限期不关。掉线后要连请手动点。
             if remember:
                 self._remember_peer(peer)
 
+    #: 「TCP 并发」：一次传输并发开几条数据连接（1~8，填 1 = 单连接）。落盘。
+    def concurrency(self) -> int:
+        return self._concurrency
+
+    def set_concurrency(self, n: int) -> None:
+        self._concurrency = max(1, min(8, int(n)))
+        try:
+            self.transfer.parallel = self._concurrency      # 立刻生效（并发发送数）
+        except Exception:
+            pass
+        try:
+            save_prefs(tcp_concurrency=str(self._concurrency))
+        except Exception:
+            pass
+        self.bus.publish(EventType.LOG, f"TCP 并发已设为 {self._concurrency} 条")
+
+    #: 连接闲置多久自动关闭（分钟）。「保持长连接」开着时无限期。
+    def conn_timeout_minutes(self) -> int:
+        return self._conn_timeout_min
+
+    def set_conn_timeout_minutes(self, minutes: int) -> None:
+        self._conn_timeout_min = max(1, int(minutes))
+        try:
+            save_prefs(conn_timeout_min=str(self._conn_timeout_min))
+        except Exception:
+            pass
+        self.bus.publish(EventType.LOG, f"连接闲置 {self._conn_timeout_min} 分钟后自动关闭")
+
+    def keep_alive(self) -> bool:
+        """「保持长连接」是否开启。"""
+        return self._keep_alive
+
+    def set_keep_alive(self, on: bool) -> None:
+        """开关「保持长连接」：更密心跳 + 空闲不断开（落盘，重启后保持）。"""
+        self._keep_alive = bool(on)
+        try:
+            save_prefs(keep_alive="1" if on else "0")
+        except Exception:
+            pass
+        self.bus.publish(EventType.LOG, "已开启「保持长连接」" if on else "已关闭「保持长连接」")
+        if on:
+            # 一次性：把已发现的设备各接一次（之后不再自动重连、也不会自动关）
+            try:
+                for peer in self.discovery.snapshot():
+                    if self.transport.get_session(peer.device_id) is None:
+                        try:
+                            self.transport.connect_control(peer.ip, peer.device_id, peer.tcp_port)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     def _ping_sessions(self, now: float) -> None:
+        # 心跳间隔：「保持长连接」开着时更密
+        ping_interval = KEEPALIVE_PING if self._keep_alive else PING_INTERVAL
+        # 闲置关闭：保持长连接 = **无限期**；否则用设置里的分钟数
+        timeout = None if self._keep_alive else max(1, self._conn_timeout_min) * 60.0
         for sess in self.transport.sessions():
-            if now - sess.last_pong > PEER_TIMEOUT:
+            if timeout is not None and now - sess.last_pong > timeout:
                 sess.close()
                 continue
-            if now - self._last_ping.get(sess.peer_id, 0.0) >= PING_INTERVAL:
+            if now - self._last_ping.get(sess.peer_id, 0.0) >= ping_interval:
                 self._last_ping[sess.peer_id] = now
                 sess.send(messages.envelope("ping", self.cfg.device_id, sess.peer_id, {}))
 

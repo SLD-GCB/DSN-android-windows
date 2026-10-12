@@ -2,125 +2,61 @@ package com.dasinong.backend.net
 
 import com.dasinong.backend.protocol.FrameCodec
 import com.dasinong.backend.protocol.FrameType
+import com.dasinong.backend.security.Identity
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
-import org.bouncycastle.jce.ECNamedCurveTable
 import org.bouncycastle.jce.provider.BouncyCastleProvider
-import org.bouncycastle.jce.spec.ECNamedCurveParameterSpec
-import org.bouncycastle.jce.spec.ECPrivateKeySpec
-import org.bouncycastle.jce.spec.ECPublicKeySpec
-import org.bouncycastle.math.ec.ECPoint
-import org.bouncycastle.math.ec.FixedPointCombMultiplier
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import java.math.BigInteger
 import java.net.Socket
-import java.security.KeyFactory
-import java.security.KeyPair
 import java.security.KeyStore
-import java.security.MessageDigest
 import java.security.SecureRandom
-import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.util.Base64
 import java.util.Date
-import javax.crypto.Mac
-import javax.crypto.SecretKeyFactory
-import javax.crypto.spec.PBEKeySpec
-import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.X509TrustManager
 
-/** 隧道层错误（口令不一致 / 对端不是本协议 / TLS 失败）。 */
+/** 隧道层错误（对端不是本协议 / 签名不对 / TLS 失败）。 */
 class TunnelError(message: String) : Exception(message)
 
+/** 一条**已完成身份认证**的连接。 */
+class PeerAuth(
+    val sock: Socket,
+    /** 已认证的对端公钥指纹（SPKI DER 的 SHA-256） */
+    val fp: String,
+    /** 对端公钥 SPKI DER */
+    val pubDer: ByteArray,
+    /** 本次握手的 nonce（原始字节；配对短码要用它） */
+    val nonce: ByteArray,
+)
+
 /**
- * 加密隧道（dsn-tunnel v3）—— 与电脑端 `net/tunnel.py` 对接。
+ * 加密隧道（dsn-tunnel **v4**）—— 与电脑端 `net/tunnel.py` 对接。
  *
- * 参照 honglu-tunnel v1（`ai酒馆/酒馆隧道.py` + `鸿胪寺/后端/隧道.kt`）：
+ * v3 的身份是**口令派生**（同口令 = 同身份、可互相冒充）；v4 换成**每设备随机身份**，
+ * 因此握手方式必须变：
+ *
  *  · **加密**：标准 TLS（Android Conscrypt）。**密码学一行不自己造。**
- *  · **身份**：口令 --PBKDF2--> 32B 材料 --> P-256 私钥 --> 自签证书。
- *    两端用同一口令推出**同一把公钥**，本端**只钉这个指纹** —— 不知道口令的人
- *    推不出这把公钥，也就连不上、冒充不了。
- *  · **TLS 之上再加一道 HMAC 双向认证**，给出明确的「口令不一致」报错。
- *  · **口令为空 = 不加密**：原样返回裸 socket。
- *
- * 口令密钥**域分离**：`keyFor(口令, 用途) = PBKDF2(口令, 盐+"|"+用途, 200000)`，
- * 用途 `hello`（发现签名，明文广播必须走 PBKDF2）/ `auth`（AUTH 握手）。
- * 身份派生用不带用途后缀的 `deriveKey(口令)`（保持与电脑端一致的指纹）。
+ *  · **两侧都不预知对端指纹** → TLS 层**不校验**证书链；身份证明放在**应用层**：
+ *    双方各自用私钥对 `方向|nonce|对端指纹` 签名，对方用它**声明的公钥**验签。
+ *    nonce 防重放、对端指纹防中继/降级。
+ *  · **是否信任**由**配对表**决定（控制层知道 device_id 后判定）—— 握手只负责
+ *    "证明你持有你自称的那把钥匙"。
+ *  · 发现报文的签名也从 HMAC 改为**设备私钥签名**。
  *
  * ⚠ 全是**阻塞**接口：给协程里 `withContext(Dispatchers.IO)` 用。
  */
 object Tunnel {
-    const val SALT_TEXT = "dasinong-tunnel-v1"
-    const val ITERATIONS = 200_000
     const val MAGIC_TEXT = "DSN1"
-    val SALT: ByteArray = SALT_TEXT.toByteArray(Charsets.UTF_8)
     val MAGIC: ByteArray = MAGIC_TEXT.toByteArray(Charsets.UTF_8)
 
-    /** P-256 曲线阶 n。 */
-    private val P256_ORDER =
-        BigInteger("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16)
-
-    private val provider = BouncyCastleProvider()
     private val random = SecureRandom()
 
-    /** 口令 → 32 字节密钥材料（PBKDF2-HMAC-SHA256，**不带用途后缀**）。用于身份派生。 */
-    fun deriveKey(passphrase: String): ByteArray =
-        SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-            .generateSecret(PBEKeySpec(passphrase.toCharArray(), SALT, ITERATIONS, 256)).encoded
-
-    /** 口令 → 某用途的 HMAC 密钥（域分离）。**必须跟电脑端一致。** */
-    fun keyFor(passphrase: String, purpose: String): ByteArray =
-        SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(
-            PBEKeySpec(
-                passphrase.toCharArray(),
-                SALT + "|".toByteArray(Charsets.UTF_8) + purpose.toByteArray(Charsets.UTF_8),
-                ITERATIONS,
-                256,
-            ),
-        ).encoded
-
-    private fun curveSpec(): ECNamedCurveParameterSpec =
-        ECNamedCurveTable.getParameterSpec("secp256r1") as ECNamedCurveParameterSpec
-
-    /** 口令 → 期望公钥点（BouncyCastle 算 d·G）。 */
-    fun publicKeyPoint(passphrase: String): ECPoint {
-        val spec = curveSpec()
-        val d = BigInteger(1, deriveKey(passphrase)).mod(spec.n.subtract(BigInteger.ONE)).add(BigInteger.ONE)
-        return FixedPointCombMultiplier().multiply(spec.g, d).normalize()
-    }
-
-    /** 口令 → P-256 公钥对象（JCA）。 */
-    fun publicKeyOf(passphrase: String): java.security.PublicKey {
-        val spec = curveSpec()
-        return KeyFactory.getInstance("EC", provider)
-            .generatePublic(ECPublicKeySpec(publicKeyPoint(passphrase), spec))
-    }
-
-    private fun privateKeyOf(passphrase: String): java.security.PrivateKey {
-        val spec = curveSpec()
-        val d = BigInteger(1, deriveKey(passphrase)).mod(spec.n.subtract(BigInteger.ONE)).add(BigInteger.ONE)
-        return KeyFactory.getInstance("EC", provider).generatePrivate(ECPrivateKeySpec(d, spec))
-    }
-
     fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
-
-    fun hmacHex(key: ByteArray, text: String): String {
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(key, "HmacSHA256"))
-        return hex(mac.doFinal(text.toByteArray(Charsets.UTF_8)))
-    }
-
-    /**
-     * 口令 → **公钥指纹**（SPKI DER 的 SHA-256）。**两端必须一致。**
-     * 这是给两端"钉"的那串；别用整张证书的哈希（序列号/有效期每次都变）。
-     */
-    fun fingerprintOf(passphrase: String): String {
-        if (passphrase.isEmpty()) return ""
-        return hex(MessageDigest.getInstance("SHA-256").digest(publicKeyOf(passphrase).encoded))
-    }
 
     /** 发现报文签名的规范化字段串（**两端必须一致**）。 */
     fun helloFields(
@@ -133,12 +69,21 @@ object Tunnel {
     ): String = listOf(fromId, name, deviceType, tcpPort.toString(), udpPort.toString(), ts.toString())
         .joinToString("|")
 
-    internal fun authMac(passphrase: String, side: String, nonce: String): String =
-        if (passphrase.isEmpty()) "" else hmacHex(keyFor(passphrase, "auth"), "$side|$nonce")
+    /** 用 hello 里声明的公钥验发现报文的签名。任何异常都当失败。 */
+    fun verifyHello(pubB64: String, fields: String, sigB64: String): Boolean = try {
+        Identity.verify(
+            Base64.getDecoder().decode(pubB64),
+            fields.toByteArray(Charsets.UTF_8),
+            Base64.getDecoder().decode(sigB64),
+        )
+    } catch (_: Exception) {
+        false
+    }
 
-    // ---- AUTH 帧的载荷：自己拼/解析，避免依赖 org.json（JVM 单测里是桩会抛 not mocked）----
-    internal fun authJson(key: String, value: String): ByteArray =
-        "{\"$key\":\"$value\"}".toByteArray(Charsets.UTF_8)
+    // ---- AUTH 帧载荷：手拼/正则解析，避免依赖 org.json（JVM 单测里是桩会抛 not mocked）----
+    internal fun jsonOf(vararg pairs: Pair<String, String>): ByteArray =
+        pairs.joinToString(",", "{", "}") { "\"${it.first}\":\"${it.second}\"" }
+            .toByteArray(Charsets.UTF_8)
 
     internal fun authField(body: ByteArray, key: String): String {
         val text = String(body, Charsets.UTF_8)
@@ -146,24 +91,48 @@ object Tunnel {
         return m.groupValues[1]
     }
 
-    internal fun nonce(): String = hex(ByteArray(16).also { random.nextBytes(it) })
+    internal fun newNonce(): ByteArray = ByteArray(16).also { random.nextBytes(it) }
 
-    // ---- 握手 ----
+    // ---- 握手（模块级，便于单测）----
 
-    fun handshakeServer(sock: Socket, passphrase: String) {
+    private fun b64(b: ByteArray): String = Base64.getEncoder().encodeToString(b)
+
+    private fun b64d(s: String): ByteArray = Base64.getDecoder().decode(s)
+
+    /** 服务端侧：发 magic + AUTH_HELLO{nonce,fp}，验客户端签名，回 AUTH_RES。 */
+    fun handshakeServer(sock: Socket, identity: Identity): PeerAuth {
         val out = sock.getOutputStream()
         val ins = sock.getInputStream()
         try {
-            out.write(MAGIC); out.flush()
-            val nonce = nonce()
-            FrameCodec.writeFrame(out, FrameType.AUTH_HELLO, authJson("nonce", nonce))
+            out.write(MAGIC)
+            out.flush()
+            val nonce = newNonce()
+            val nonceHex = hex(nonce)
+            // `fp` 是服务端**自报**的指纹：客户端把它纳入签名，服务端再核对自己是不是它
+            FrameCodec.writeFrame(
+                out, FrameType.AUTH_HELLO,
+                jsonOf("nonce" to nonceHex, "fp" to identity.fingerprint),
+            )
             val frame = FrameCodec.readFrame(ins) ?: throw TunnelError("隧道握手中连接被关闭")
             if (frame.type != FrameType.AUTH_REQ) throw TunnelError("隧道握手帧不对（预期 AUTH_REQ）")
-            if (passphrase.isNotEmpty() && authField(frame.body, "mac") != authMac(passphrase, "client", nonce)) {
-                FrameCodec.writeFrame(out, FrameType.AUTH_ERR, authJson("错", "口令不一致"))
-                throw TunnelError("口令不一致")
+            val fpC = authField(frame.body, "fp")
+            val pubC = b64d(authField(frame.body, "pub"))
+            val sigC = b64d(authField(frame.body, "sig"))
+            if (fpC.isEmpty() || Identity.hex(java.security.MessageDigest.getInstance("SHA-256").digest(pubC)) != fpC) {
+                throw TunnelError("对端公钥与声明指纹不符")
             }
-            FrameCodec.writeFrame(out, FrameType.AUTH_RES, authJson("mac2", authMac(passphrase, "server", nonce)))
+            val payload = "client|$nonceHex|${identity.fingerprint}".toByteArray(Charsets.UTF_8)
+            if (!Identity.verify(pubC, payload, sigC)) {
+                FrameCodec.writeFrame(out, FrameType.AUTH_ERR, jsonOf("错" to "对方身份签名校验未通过"))
+                throw TunnelError("对方身份签名校验未通过")
+            }
+            val payloadS = "server|$nonceHex|$fpC".toByteArray(Charsets.UTF_8)
+            FrameCodec.writeFrame(
+                out, FrameType.AUTH_RES,
+                jsonOf("fp" to identity.fingerprint, "pub" to b64(identity.spkiDer),
+                    "sig" to b64(identity.sign(payloadS))),
+            )
+            return PeerAuth(sock, fpC, pubC, nonce)
         } catch (e: TunnelError) {
             throw e
         } catch (e: Exception) {
@@ -171,7 +140,8 @@ object Tunnel {
         }
     }
 
-    fun handshakeClient(sock: Socket, passphrase: String) {
+    /** 客户端侧：收 magic + AUTH_HELLO，发 AUTH_REQ（带签名），验服务端签名。 */
+    fun handshakeClient(sock: Socket, identity: Identity): PeerAuth {
         val out = sock.getOutputStream()
         val ins = sock.getInputStream()
         try {
@@ -179,15 +149,38 @@ object Tunnel {
             if (!magic.contentEquals(MAGIC)) throw TunnelError("对面不是大司农隧道（magic 不对）")
             val hello = FrameCodec.readFrame(ins) ?: throw TunnelError("隧道握手中连接被关闭")
             if (hello.type != FrameType.AUTH_HELLO) throw TunnelError("隧道握手帧不对（预期 AUTH_HELLO）")
-            val nonce = authField(hello.body, "nonce")
-            if (nonce.isEmpty()) throw TunnelError("隧道握手缺少 nonce")
-            FrameCodec.writeFrame(out, FrameType.AUTH_REQ, authJson("mac", authMac(passphrase, "client", nonce)))
+            val nonceHex = authField(hello.body, "nonce")
+            if (nonceHex.isEmpty()) throw TunnelError("隧道握手缺少 nonce")
+            val nonce = nonceHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            // 客户端签名覆盖：方向 + nonce + 服务端自报指纹（防中继/降级）
+            val sfp = authField(hello.body, "fp")
+            val payload = "client|$nonceHex|$sfp".toByteArray(Charsets.UTF_8)
+            FrameCodec.writeFrame(
+                out, FrameType.AUTH_REQ,
+                jsonOf("fp" to identity.fingerprint, "pub" to b64(identity.spkiDer),
+                    "sig" to b64(identity.sign(payload))),
+            )
             val res = FrameCodec.readFrame(ins) ?: throw TunnelError("隧道握手中连接被关闭")
-            if (res.type == FrameType.AUTH_ERR) throw TunnelError("口令与对方不一致（对方拒绝了本次认证）")
-            if (res.type != FrameType.AUTH_RES) throw TunnelError("隧道握手帧不对（预期 AUTH_RES）")
-            if (passphrase.isNotEmpty() && authField(res.body, "mac2") != authMac(passphrase, "server", nonce)) {
-                throw TunnelError("对方未通过口令校验（口令不一致？）")
+            if (res.type == FrameType.AUTH_ERR) {
+                throw TunnelError(authField(res.body, "错").ifEmpty { "对方拒绝了本次认证" })
             }
+            if (res.type != FrameType.AUTH_RES) throw TunnelError("隧道握手帧不对（预期 AUTH_RES）")
+            val fpS = authField(res.body, "fp")
+            val pubS = b64d(authField(res.body, "pub"))
+            val sigS = b64d(authField(res.body, "sig"))
+            if (fpS.isEmpty() ||
+                Identity.hex(java.security.MessageDigest.getInstance("SHA-256").digest(pubS)) != fpS
+            ) {
+                throw TunnelError("对端公钥与声明指纹不符")
+            }
+            if (sfp.isNotEmpty() && sfp != fpS) {
+                throw TunnelError("对端身份与它自己声明的不一致（疑似中间人）")
+            }
+            val payloadS = "server|$nonceHex|${identity.fingerprint}".toByteArray(Charsets.UTF_8)
+            if (!Identity.verify(pubS, payloadS, sigS)) {
+                throw TunnelError("对方身份签名校验未通过")
+            }
+            return PeerAuth(sock, fpS, pubS, nonce)
         } catch (e: TunnelError) {
             throw e
         } catch (e: Exception) {
@@ -196,51 +189,25 @@ object Tunnel {
     }
 }
 
-/** 按口令构建的隧道上下文：持有身份与 TLS 上下文，可被多线程复用。 */
-class TunnelContext(val passphrase: String) {
+/** 隧道上下文：持有本机身份与 TLS 上下文，可被多线程复用。 */
+class TunnelContext(val identity: Identity) {
 
-    /** 口令为空 = 不加密（原样返回裸 socket）。 */
-    val enabled: Boolean = passphrase.isNotEmpty()
+    /** v4 起恒为 true（引擎在没身份时不启动网络）。 */
+    val enabled: Boolean = true
 
-    /** 本机隧道公钥指纹（口令为空则空串）。 */
-    val fingerprint: String = Tunnel.fingerprintOf(passphrase)
+    /** 本机身份指纹。⚠ 不外显（用户硬要求：界面不显示本机指纹）。 */
+    val fingerprint: String = identity.fingerprint
+
+    /** 本机公钥（base64 SPKI），发现广播里带上它。 */
+    val spkiB64: String = Base64.getEncoder().encodeToString(identity.spkiDer)
 
     private val provider = BouncyCastleProvider()
     private var serverCtx: SSLContext? = null
     private var clientCtx: SSLContext? = null
 
     init {
-        // 身份由口令派生（两端相同）→ 服务端上下文需要一张自签证书
-        if (enabled) {
-            val priv = privateKeyOf()
-            val pub = Tunnel.publicKeyOf(passphrase)
-            serverCtx = buildServerContext(priv, buildSelfSigned(priv, pub), provider)
-            clientCtx = buildClientContext(fingerprint)
-        }
-    }
-
-    private fun privateKeyOf(): java.security.PrivateKey {
-        val spec = ECNamedCurveTable.getParameterSpec("secp256r1") as ECNamedCurveParameterSpec
-        val d = BigInteger(1, Tunnel.deriveKey(passphrase)).mod(spec.n.subtract(BigInteger.ONE)).add(BigInteger.ONE)
-        return KeyFactory.getInstance("EC", provider).generatePrivate(ECPrivateKeySpec(d, spec))
-    }
-
-    private fun buildSelfSigned(
-        priv: java.security.PrivateKey,
-        pub: java.security.PublicKey,
-    ): X509Certificate {
-        val name = X500Name("CN=dasinong-tunnel")
-        val now = System.currentTimeMillis()
-        val builder = JcaX509v3CertificateBuilder(
-            name,
-            BigInteger(64, SecureRandom()),
-            Date(now - 86_400_000L),
-            Date(now + 3650L * 86_400_000L),
-            name,
-            pub,
-        )
-        val signer = JcaContentSignerBuilder("SHA256withECDSA").setProvider(provider).build(priv)
-        return JcaX509CertificateConverter().setProvider(provider).getCertificate(builder.build(signer))
+        serverCtx = buildServerContext(identity.privateKey, identity.cert, provider)
+        clientCtx = buildClientContext()
     }
 
     private fun buildServerContext(
@@ -258,20 +225,15 @@ class TunnelContext(val passphrase: String) {
         return ctx
     }
 
-    /** 客户端只认"由口令推出的那把公钥"—— 口令不一致 → 指纹对不上 → 连不上。 */
-    private fun buildClientContext(expectedFingerprint: String): SSLContext {
+    /**
+     * 客户端上下文**不校验证书链** —— 对端指纹事先不知道，身份由应用层签名证明
+     * （见 [Tunnel.handshakeClient]）。TLS 只负责机密性与完整性。
+     */
+    private fun buildClientContext(): SSLContext {
         val tm = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) = Unit
-
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-
-            override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {
-                val leaf = chain?.firstOrNull() ?: throw CertificateException("对端没给证书")
-                val got = Tunnel.hex(MessageDigest.getInstance("SHA-256").digest(leaf.publicKey.encoded))
-                if (got != expectedFingerprint) {
-                    throw CertificateException("对方身份对不上 —— 口令不一致，或有人在冒充")
-                }
-            }
+            override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) = Unit
         }
         val ctx = SSLContext.getInstance("TLS")
         ctx.init(null, arrayOf<X509TrustManager>(tm), SecureRandom())
@@ -283,9 +245,8 @@ class TunnelContext(val passphrase: String) {
         if (ok.isNotEmpty()) s.enabledProtocols = ok.toTypedArray()
     }
 
-    /** 服务端侧：包 TLS + 跑握手。口令为空则原样返回。 */
-    fun accept(raw: Socket): Socket {
-        if (!enabled) return raw
+    /** 服务端侧：包 TLS + 双向签名握手，返回**已认证**的对端信息。 */
+    fun accept(raw: Socket): PeerAuth {
         val ssl = try {
             (serverCtx!!.socketFactory.createSocket(raw, null, raw.port, true) as SSLSocket).apply {
                 useClientMode = false
@@ -295,22 +256,25 @@ class TunnelContext(val passphrase: String) {
             }
         } catch (e: Exception) {
             runCatching { raw.close() }
-            throw TunnelError("TLS 握手失败（对方可能未开加密）：${e.message ?: e.javaClass.simpleName}")
+            throw TunnelError("TLS 握手失败：${e.message ?: e.javaClass.simpleName}")
         }
         return try {
             ssl.soTimeout = 20000
-            Tunnel.handshakeServer(ssl, passphrase)
+            val auth = Tunnel.handshakeServer(ssl, identity)
             ssl.soTimeout = 0
-            ssl
+            auth
         } catch (e: Exception) {
             runCatching { ssl.close() }
             throw e
         }
     }
 
-    /** 客户端侧：包 TLS + 钉指纹 + 跑握手。口令为空则原样返回。 */
-    fun connect(raw: Socket, host: String = ""): Socket {
-        if (!enabled) return raw
+    /**
+     * 客户端侧：包 TLS + 双向签名握手。
+     *
+     * **不覆盖调用方设的 socket 超时**（直连要靠它做短超时），握手完再清掉。
+     */
+    fun connect(raw: Socket, host: String = ""): PeerAuth {
         val ssl = try {
             (clientCtx!!.socketFactory.createSocket(raw, host, raw.port, true) as SSLSocket).apply {
                 useClientMode = true
@@ -319,24 +283,23 @@ class TunnelContext(val passphrase: String) {
             }
         } catch (e: Exception) {
             runCatching { raw.close() }
-            throw TunnelError("TLS 握手失败（对方可能未开加密）：${e.message ?: e.javaClass.simpleName}")
+            throw TunnelError("TLS 握手失败：${e.message ?: e.javaClass.simpleName}")
         }
         return try {
-            ssl.soTimeout = 20000
-            Tunnel.handshakeClient(ssl, passphrase)
+            val auth = Tunnel.handshakeClient(ssl, identity)
             ssl.soTimeout = 0
-            ssl
+            auth
         } catch (e: Exception) {
             runCatching { ssl.close() }
             throw e
         }
     }
 
-    /** 给发现报文的规范化字段串做 HMAC；口令为空回空串。 */
+    /** 用设备私钥签发现报文的规范化字段串（base64 的 DER 签名）。 */
     fun signHello(fields: String): String =
-        if (enabled) Tunnel.hmacHex(Tunnel.keyFor(passphrase, "hello"), fields) else ""
+        Base64.getEncoder().encodeToString(identity.sign(fields.toByteArray(Charsets.UTF_8)))
 
     fun close() {
-        // 无临时文件需要清理（证书在内存里）
+        // 证书在内存里，无临时文件需要清理
     }
 }

@@ -63,6 +63,49 @@ CREATE TABLE IF NOT EXISTS conversation (
 CREATE INDEX IF NOT EXISTS idx_conversation_updated ON conversation(updated_at);
 """
 
+#: 数据库结构版本（写在 `PRAGMA user_version`）。加表/加列就 +1，并在 `_MIGRATIONS` 补一段。
+_SCHEMA_VERSION = 4
+
+#: 早期（已作废）的 `paired` 旧表 —— 只被迁移 2/3 引用，**新代码不碰它**。
+#: 保留它是因为"迁移只增不改"；迁移 4 会把这张表删掉。
+_M_PAIRED_LEGACY = """
+CREATE TABLE IF NOT EXISTS paired (
+    device_id       TEXT PRIMARY KEY,
+    fp              TEXT NOT NULL,
+    name            TEXT,
+    first_paired_at REAL,
+    last_seen_at    REAL,
+    trusted         INTEGER NOT NULL DEFAULT 1
+);
+"""
+
+#: ⚠ 配对表**新名字** `paired_v2`：更早的 v4 时代用 `paired` 建过**列不一样**的表，而
+#: `CREATE TABLE IF NOT EXISTS` 不看列 → 会重演"表在但列不对"的老 bug。
+#: **不要再改回 `paired`。**
+_PAIRED_TABLE = "paired_v2"
+
+_M_PAIRED_V2 = f"""
+CREATE TABLE IF NOT EXISTS {_PAIRED_TABLE} (
+    device_id       TEXT PRIMARY KEY,
+    fp              TEXT NOT NULL,
+    name            TEXT,
+    first_paired_at REAL,
+    last_seen_at    REAL,
+    trusted         INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_paired_v2_fp ON {_PAIRED_TABLE}(fp);
+"""
+
+#: 版本 4：删掉历史遗留的 `paired` + 建新表 `paired_v2`（幂等）
+_M_PAIRED_REFRESH = "DROP TABLE IF EXISTS paired;\n" + _M_PAIRED_V2
+
+#: 版本号 -> 该版本的增量 SQL（**只增不改**：已发布版本的段落不要再动）
+_MIGRATIONS: Dict[int, str] = {
+    2: "DROP TABLE IF EXISTS paired;\n" + _M_PAIRED_LEGACY,
+    3: "DROP TABLE IF EXISTS paired;\n" + _M_PAIRED_LEGACY,
+    4: _M_PAIRED_REFRESH,
+}
+
 
 class Store:
     def __init__(self, db_path: Path) -> None:
@@ -72,8 +115,40 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         with self._lock:
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """按 `PRAGMA user_version` 做**只前进**的增量迁移。
+
+        老库从没设过 `user_version`（=0），视为"基线未标记"：先幂等地建基线表
+        （全是 `CREATE TABLE IF NOT EXISTS`，对已有库无害），标成 1，再逐版本往上跑。
+        """
+        cur = int(self._conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        if cur < 1:
             self._conn.executescript(_SCHEMA)
-            self._conn.commit()
+            cur = 1
+        while cur < _SCHEMA_VERSION:
+            cur += 1
+            self._conn.executescript(_MIGRATIONS[cur])
+        # 配对表：每次打开都确保"新表在、旧表已删"（不依赖 user_version）
+        self._ensure_paired_schema()
+        # PRAGMA 不接受参数占位符；cur 是内部自增整型，无注入风险
+        self._conn.execute(f"PRAGMA user_version={cur}")
+        self._conn.commit()
+
+    def _ensure_paired_schema(self) -> None:
+        """配对表：**删掉历史遗留的 `paired` + 建新表 `paired_v2`**（幂等，每次打开都跑）。
+
+        为什么换新表名：更早的 v4 时代用 `paired` 建过**列不一样**的表，而
+        `CREATE TABLE IF NOT EXISTS` 不看列 → 新代码按新列读会抛异常。就地改名/自检还得
+        依赖"旧表当时长什么样"，换个不可能撞名的新名字就跟历史彻底脱钩了；
+        旧表里的数据来自那个已回滚的功能，直接删。
+        """
+        self._conn.executescript(_M_PAIRED_REFRESH)
+
+    def schema_version(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0] or 0)
 
     def close(self) -> None:
         with self._lock:
@@ -314,6 +389,51 @@ class Store:
         with self._lock:
             self._conn.execute("INSERT OR REPLACE INTO setting(key,value) VALUES (?,?)", (key, value))
             self._conn.commit()
+
+    def setting_delete(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM setting WHERE key=?", (key,))
+            self._conn.commit()
+
+    # ------------------------------------------------------------------ 配对设备
+    # 表名是 `paired_v2`（见 _PAIRED_TABLE）—— 旧名字 `paired` 是历史遗留，
+    # 每次打开都会被删掉（列不一致，见 _ensure_paired_schema）。
+    def pair_upsert(self, device_id: str, fp: str, name: str = "") -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO {_PAIRED_TABLE}(device_id,fp,name,first_paired_at,last_seen_at,trusted)"
+                " VALUES(?,?,?,?,?,1)"
+                " ON CONFLICT(device_id) DO UPDATE SET"
+                "   fp=excluded.fp, name=excluded.name, last_seen_at=excluded.last_seen_at,"
+                "   trusted=1",
+                (device_id, fp, name, now, now),
+            )
+            self._conn.commit()
+
+    def pair_get(self, device_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT * FROM {_PAIRED_TABLE} WHERE device_id=?", (device_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pair_all(self) -> List[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM {_PAIRED_TABLE} ORDER BY last_seen_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def pair_remove(self, device_id: str) -> None:
+        with self._lock:
+            self._conn.execute(f"DELETE FROM {_PAIRED_TABLE} WHERE device_id=?", (device_id,))
+            self._conn.commit()
+
+    def pair_is_trusted(self, device_id: str, fp: str) -> bool:
+        """该 device_id 是否已配对**且**指纹一致（指纹变了视为不再信任）。"""
+        row = self.pair_get(device_id)
+        return bool(row) and bool(row.get("trusted")) and str(row.get("fp") or "") == fp
 
 
 def _file_from_dict(obj: dict) -> FileEntry:

@@ -2,6 +2,7 @@ package com.dasinong.backend.store
 
 import android.content.ContentValues
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.dasinong.backend.model.ChatMessage
@@ -16,10 +17,11 @@ import org.json.JSONObject
  * ⚠ **数据库版本号只能单调递增**：一旦降号，`SQLiteOpenHelper` 会走 `onDowngrade`，
  * 而它的默认实现是**直接抛异常** —— 表现为 App 一打开就闪退。
  * v4 曾把版本提到 3（paired 表），随后功能回滚但**版本号必须留在 3**。
- * v5（会话表）提到 4 —— 同样只许加不许减。
+ * v5（会话表）提到 4；v6（配对表，为 v4 身份+配对铺路）提到 5；
+ * v8（**换新表名** `paired_v2`，并删掉遗留的 `paired`）提到 7 —— 同样只许加不许减。
  */
 class ChatDb(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "dasinong.db", null, 4) {
+    SQLiteOpenHelper(context.applicationContext, "dasinong.db", null, 7) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -66,6 +68,7 @@ class ChatDb(context: Context) :
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_transfer_group ON transfer(group_id)")
         db.execSQL(CREATE_CONVERSATION)
+        db.execSQL(CREATE_PAIRED)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -83,6 +86,30 @@ class ChatDb(context: Context) :
         if (oldVersion < 4) {
             db.execSQL(CREATE_CONVERSATION)
         }
+        if (oldVersion < 5) {
+            db.execSQL(CREATE_PAIRED)
+        }
+        // v8：换成新表名 `paired_v2`，并删掉历史遗留的 `paired`（列不一致，见 refreshPairingTable）
+        refreshPairingTable(db)
+    }
+
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        // 每次打开都跑一遍：新表名不可能与历史撞名，建表幂等；顺手清掉旧名残留
+        refreshPairingTable(db)
+    }
+
+    /**
+     * 配对表：**建新表 + 删旧表**（幂等，每次打开都跑）。
+     *
+     * 为什么不再"就地修旧表"：更早的 v4 时代建过**列不一样**的同名 `paired` 表，而
+     * `CREATE TABLE IF NOT EXISTS` 不看列 → 新代码按新列读就炸。就地自检还要依赖
+     * "旧表当时到底长什么样"；干脆**换个不可能撞名的新表名**，跟历史彻底脱钩。
+     * 旧表里的数据来自那个已回滚的功能，直接删掉。
+     */
+    private fun refreshPairingTable(db: SQLiteDatabase) {
+        runCatching { db.execSQL("DROP TABLE IF EXISTS paired") }   // 清掉历史遗留
+        db.execSQL(CREATE_PAIRED)                                   // CREATE TABLE IF NOT EXISTS paired_v2
     }
 
     companion object {
@@ -100,6 +127,26 @@ class ChatDb(context: Context) :
                 hidden     INTEGER NOT NULL DEFAULT 0
             )
         """
+
+        /**
+         * 配对设备表：用途是 v4（每设备身份 + 配对确认）。
+         */
+        /**
+         * 配对设备表（v8 起叫 `paired_v2`）。
+         *
+         * ⚠ **不要改回 `paired` 这个名字**：更早的 v4 时代用那个名字建过列不一样的表，
+         * 而 `CREATE TABLE IF NOT EXISTS` 不看列 → 会重演"表在但列不对"的老 bug。
+         */
+        private const val CREATE_PAIRED = """
+            CREATE TABLE IF NOT EXISTS paired_v2 (
+                device_id       TEXT PRIMARY KEY,
+                fp              TEXT NOT NULL,
+                name            TEXT,
+                first_paired_at INTEGER,
+                last_seen_at    INTEGER,
+                trusted         INTEGER NOT NULL DEFAULT 1
+            )
+        """
     }
 
     // ------------------------------------------------------------ 设置项
@@ -114,6 +161,65 @@ class ChatDb(context: Context) :
         }
         writableDatabase.insertWithOnConflict("setting", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
+
+    fun settingDelete(key: String) {
+        writableDatabase.delete("setting", "key=?", arrayOf(key))
+    }
+
+    // ------------------------------------------------------------ 配对设备
+    data class PairedRow(
+        val deviceId: String,
+        val fp: String,
+        val name: String?,
+        val firstPairedAt: Long,
+        val lastSeenAt: Long,
+        val trusted: Boolean,
+    )
+
+    fun pairUpsert(deviceId: String, fp: String, name: String?) {
+        val now = System.currentTimeMillis()
+        val cv = ContentValues().apply {
+            put("device_id", deviceId)
+            put("fp", fp)
+            put("name", name)
+            put("first_paired_at", now)
+            put("last_seen_at", now)
+            put("trusted", 1)
+        }
+        writableDatabase.insertWithOnConflict("paired_v2", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun pairGet(deviceId: String): PairedRow? =
+        readableDatabase.query(
+            "paired_v2", null, "device_id=?", arrayOf(deviceId), null, null, null,
+        ).use { c -> if (c.moveToFirst()) c.toPairedRow() else null }
+
+    fun pairAll(): List<PairedRow> {
+        val out = ArrayList<PairedRow>()
+        readableDatabase.query("paired_v2", null, null, null, null, null, "last_seen_at DESC").use { c ->
+            while (c.moveToNext()) out.add(c.toPairedRow())
+        }
+        return out
+    }
+
+    fun pairRemove(deviceId: String) {
+        writableDatabase.delete("paired_v2", "device_id=?", arrayOf(deviceId))
+    }
+
+    /** 该 deviceId 是否已配对**且**指纹一致（指纹变了视为不再信任）。 */
+    fun pairIsTrusted(deviceId: String, fp: String): Boolean {
+        val row = pairGet(deviceId) ?: return false
+        return row.trusted && row.fp == fp
+    }
+
+    private fun Cursor.toPairedRow(): PairedRow = PairedRow(
+        deviceId = getString(getColumnIndexOrThrow("device_id")),
+        fp = getString(getColumnIndexOrThrow("fp")) ?: "",
+        name = getString(getColumnIndexOrThrow("name")),
+        firstPairedAt = getLong(getColumnIndexOrThrow("first_paired_at")),
+        lastSeenAt = getLong(getColumnIndexOrThrow("last_seen_at")),
+        trusted = getInt(getColumnIndexOrThrow("trusted")) != 0,
+    )
 
     // ------------------------------------------------------------ 消息
     fun addMessage(msg: ChatMessage) {

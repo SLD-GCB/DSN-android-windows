@@ -20,6 +20,12 @@ sealed class Event {
 
     /** 手动 IP 会话已绑定到真实设备（发现后自动升级），UI 据此切换当前会话。 */
     data class ConversationRebound(val oldId: String, val newId: String) : Event()
+
+    /** 需要用户确认配对：UI 弹窗显示 6 位短码，并调 `engine.answerPairing()` 回答。 */
+    data class PairRequestEvent(val request: PairRequest) : Event()
+
+    /** 配对表变化（配上了 / 解绑了），UI 据此刷新列表与设备标记。 */
+    data class PairedChanged(val deviceId: String, val paired: Boolean) : Event()
 }
 
 class EventBus {

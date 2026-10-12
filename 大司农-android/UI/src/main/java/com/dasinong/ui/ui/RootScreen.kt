@@ -45,7 +45,9 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -53,6 +55,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -61,10 +64,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -74,8 +80,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -87,6 +91,7 @@ import com.dasinong.backend.model.MsgKind
 import com.dasinong.backend.model.Peer
 import com.dasinong.backend.model.Transfer
 import com.dasinong.backend.model.TransferState
+import com.dasinong.backend.protocol.Proto
 import com.dasinong.ui.ui.theme.DasinongTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -138,12 +143,18 @@ fun RootScreen(vm: AppViewModel = viewModel()) {
                 }
             }
         }
+        // 配对确认：任何页面都可能弹（后端在等这个回答）
+        val pairReq by vm.pairRequest.collectAsStateWithLifecycle()
+        pairReq?.let { req -> PairingDialog(req, onAnswer = { vm.answerPairing(req.peerId, it) }) }
     }
 }
 
 // ================================================================ 附近
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NearbyScreen(vm: AppViewModel, onOpenChat: (String) -> Unit) {
+    var refreshing by remember { mutableStateOf(false) }
+    val refreshScope = rememberCoroutineScope()
     val peers by vm.peers.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var target by remember { mutableStateOf<String?>(null) }
@@ -177,6 +188,16 @@ private fun NearbyScreen(vm: AppViewModel, onOpenChat: (String) -> Unit) {
         if (uri != null) vm.sendFiles(t, UriFiles.fromTree(context, uri))
     }
 
+    val keepAliveOn by vm.keepAlive.collectAsStateWithLifecycle()
+
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = {
+            refreshing = true
+            vm.refreshAll()
+            refreshScope.launch { delay(500); refreshing = false }
+        },
+    ) {
     Column(Modifier.fillMaxSize().padding(12.dp)) {
         Text(
             "同一局域网（含手机热点）下自动发现设备",
@@ -191,14 +212,35 @@ private fun NearbyScreen(vm: AppViewModel, onOpenChat: (String) -> Unit) {
                 val connected = remember(tick) { vm.isConnected(peer.deviceId) }
                 Card(Modifier.fillMaxWidth().clickable { onOpenChat(peer.deviceId) }) {
                     Column(Modifier.padding(12.dp)) {
-                        Text(
-                            "${if (connected) "●" else "○"} ${peer.name}",
-                            fontWeight = FontWeight.Bold,
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "${if (connected) "●" else "○"} ${peer.name}",
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.weight(1f),
+                            )
+                            // 胶囊「保持长连接」滑块（设备名那一行最右边）
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = if (keepAliveOn) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surfaceVariant,
+                            ) {
+                                Row(
+                                    Modifier.padding(start = 10.dp, end = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text("保持", style = MaterialTheme.typography.labelSmall)
+                                    Switch(
+                                        checked = keepAliveOn,
+                                        onCheckedChange = { vm.setKeepAliveEnabled(it) },
+                                    )
+                                }
+                            }
+                        }
                         Text(
                             "${if (peer.deviceType == "android") "手机" else "电脑"} · ${peer.ip} · " +
                                 (if (connected) "已连接" else "未连接") +
-                                if (peer.encrypted) " · 🔒 已加密" else " · 未加密",
+                                (if (peer.incompatible) " · ⚠ 版本过旧"
+                                else if (vm.isPaired(peer.deviceId)) " · 已配对" else " · 未配对"),
                             style = MaterialTheme.typography.bodySmall,
                         )
                         // 按钮分两行排列（一行四个会溢出被裁掉）
@@ -244,10 +286,25 @@ private fun NearbyScreen(vm: AppViewModel, onOpenChat: (String) -> Unit) {
                             onClick = { appTarget = peer.deviceId },
                             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                         ) { Text("分享应用") }
+                        // 未配对时：手动发起配对（配对失败后不会再自动重试，需要在这里点一次）
+                        if (!peer.incompatible && !vm.isPaired(peer.deviceId)) {
+                            OutlinedButton(
+                                onClick = { vm.pairWith(peer.deviceId) },
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            ) { Text("配对") }
+                        }
+                        // 手动连接（退出再进软件后也能手动连上）
+                        if (!peer.incompatible && !vm.isConnected(peer.deviceId)) {
+                            OutlinedButton(
+                                onClick = { vm.connectPeer(peer.deviceId) },
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            ) { Text("连接") }
+                        }
                     }
                 }
             }
         }
+    }
     }
 
     val at = appTarget
@@ -441,6 +498,10 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
     val imagePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(),
     ) { uris -> vm.sendFiles(convId, uris.mapNotNull { UriFiles.fromUri(context, it) }) }
+    // 传文件夹（整棵目录树）
+    val folderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri -> if (uri != null) vm.sendFiles(convId, UriFiles.fromTree(context, uri)) }
 
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -469,7 +530,16 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             items(messages[convId].orEmpty(), key = { it.msgId }) { m ->
-                MessageBubble(m, onDelete = { pendingDelete = m })
+                MessageBubble(
+                    m,
+                    // 这一条对应的传输任务（用来在气泡上显示进度）
+                    transfer = vm.transfers.collectAsStateWithLifecycle().value.values.firstOrNull {
+                        // 优先按 transferId（组）匹配：发送端的消息 fileId 是新生成的，和传输任务不同
+                        (m.transferId != null && it.transferId == m.transferId) ||
+                            (m.file != null && it.file?.fileId == m.file?.fileId)
+                    },
+                    onDelete = { pendingDelete = m },
+                )
             }
         }
 
@@ -498,16 +568,38 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
                     }
                 },
             )
+            // 发送按钮**分两排**（一排两个，不会挤）
             Row(
                 Modifier.fillMaxWidth().padding(top = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                OutlinedButton(onClick = {
-                    imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                }) { Text("图片") }
-                OutlinedButton(onClick = { filePicker.launch(arrayOf("*/*")) }) { Text("文件") }
-                OutlinedButton(onClick = { showAppPicker = true }) { Text("应用") }
+                OutlinedButton(
+                    onClick = {
+                        imagePicker.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("图片") }
+                OutlinedButton(
+                    onClick = { filePicker.launch(arrayOf("*/*")) },
+                    modifier = Modifier.weight(1f),
+                ) { Text("文件") }
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = { folderPicker.launch(null) },
+                    modifier = Modifier.weight(1f),
+                ) { Text("文件夹") }
+                OutlinedButton(
+                    onClick = { showAppPicker = true },
+                    modifier = Modifier.weight(1f),
+                ) { Text("应用") }
             }
         }
     }
@@ -560,7 +652,7 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(msg: ChatMessage, onDelete: () -> Unit) {
+private fun MessageBubble(msg: ChatMessage, transfer: Transfer?, onDelete: () -> Unit) {
     val align = if (msg.outgoing) Alignment.CenterEnd else Alignment.CenterStart
     val bg = if (msg.outgoing) MaterialTheme.colorScheme.primaryContainer
     else MaterialTheme.colorScheme.surfaceVariant
@@ -598,11 +690,65 @@ private fun MessageBubble(msg: ChatMessage, onDelete: () -> Unit) {
                 MsgKind.FILE -> Text("📄 ${msg.file?.name ?: "文件"}")
                 MsgKind.SYSTEM -> Text(msg.text, style = MaterialTheme.typography.bodySmall)
             }
+            // 文件/图片：在气泡里**就地显示进度**（不用去传输页看）
+            if (transfer != null &&
+                (transfer.state == TransferState.ACTIVE || transfer.state == TransferState.PENDING)) {
+                LinearProgressIndicator(
+                    progress = { transfer.progress },
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                )
+                Text(
+                    "${(transfer.progress * 100).toInt()}%  " +
+                        if (transfer.direction == "recv") "接收中" else "发送中",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            } else if (transfer != null && transfer.state == TransferState.FAILED) {
+                Text(
+                    "传输失败", color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
             if (msg.outgoing) {
                 Text(msgStatusText(msg.status), style = MaterialTheme.typography.labelSmall)
             }
         }
     }
+}
+
+// ================================================================ 配对确认
+/**
+ * 配对弹窗：两端显示**同一个 6 位数字**，核对一致再点「配对」。
+ *
+ * ⚠ 刻意**不显示任何指纹**（用户硬要求）—— 短码是本次会话的临时值。
+ */
+@Composable
+private fun PairingDialog(req: com.dasinong.backend.PairRequest, onAnswer: (Boolean) -> Unit) {
+    AlertDialog(
+        onDismissRequest = { onAnswer(false) },
+        title = { Text("配对确认") },
+        text = {
+            Column {
+                Text("设备「${req.name}」请求与你配对。")
+                Spacer(Modifier.height(8.dp))
+                Text("请核对两台设备屏幕上显示的数字是否完全相同：")
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    req.sas.chunked(3).joinToString(" "),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "一致 → 点「配对」；不一致说明有人在中间冒充，请点「取消」。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onAnswer(true) }) { Text("配对") } },
+        dismissButton = { TextButton(onClick = { onAnswer(false) }) { Text("取消") } },
+    )
 }
 
 // ================================================================ 传输
@@ -629,12 +775,34 @@ private fun TransferScreen(vm: AppViewModel) {
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(bottom = 6.dp),
         )
+        // 导出到用户自选路径（系统保存对话框）
+        val exportTarget = remember { mutableStateOf<Transfer?>(null) }
+        val exportLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("*/*"),
+        ) { uri ->
+            val t = exportTarget.value
+            exportTarget.value = null
+            val src = t?.finalPath
+            if (uri == null || src == null) return@rememberLauncherForActivityResult
+            val ok = runCatching {
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    java.io.File(src).inputStream().use { it.copyTo(out) }
+                }
+            }.isSuccess
+            toast(context, if (ok) "已导出到所选位置" else "导出失败")
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(list, key = { it.file?.fileId ?: it.transferId }) { t ->
                 TransferRow(
                     t = t,
+                    speedText = vm.transferStat.collectAsStateWithLifecycle().value[
+                        t.file?.fileId ?: t.transferId],
                     onCancel = { vm.cancelTransfer(t.transferId) },
                     onOpen = { openLocalFile(context, t.finalPath) },
+                    onExport = {
+                        exportTarget.value = t
+                        exportLauncher.launch(t.file?.name ?: "da-sinong-export")
+                    },
                     onDelete = { pendingDelete = t },
                 )
             }
@@ -687,8 +855,10 @@ private fun TransferScreen(vm: AppViewModel) {
 @Composable
 private fun TransferRow(
     t: Transfer,
+    speedText: String?,
     onCancel: () -> Unit,
     onOpen: () -> Unit,
+    onExport: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val busy = t.state == TransferState.ACTIVE || t.state == TransferState.PENDING
@@ -698,23 +868,38 @@ private fun TransferRow(
                 "${if (t.direction == "send") "↑" else "↓"} ${t.file?.name ?: t.transferId}",
                 fontWeight = FontWeight.Bold,
             )
-            Text("${stateText(t.state)}  ${(t.progress * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
+            Text(
+                "${stateText(t.state)}  ${(t.progress * 100).toInt()}%" +
+                    if (speedText != null) "  ·  $speedText" else "",
+                style = MaterialTheme.typography.bodySmall,
+            )
             LinearProgressIndicator(
                 progress = { t.progress },
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             )
             if (t.error != null) Text(t.error!!, color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (t.finalPath != null) {
-                    OutlinedButton(onClick = onOpen, modifier = Modifier.padding(top = 6.dp)) { Text("打开") }
+            // 按钮**分两排**排列（一排两个，不会挤在一起）
+            if (t.finalPath != null) {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedButton(onClick = onOpen, modifier = Modifier.weight(1f)) { Text("打开") }
+                    // 导出：用户自选保存路径
+                    OutlinedButton(onClick = onExport, modifier = Modifier.weight(1f)) { Text("导出") }
                 }
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 if (busy || t.state == TransferState.PAUSED) {
-                    OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 6.dp)) { Text("取消") }
+                    OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) { Text("取消") }
                 }
                 // 进行中不给删（先取消），其余状态都可以自由删
                 if (!busy) {
-                    OutlinedButton(onClick = onDelete, modifier = Modifier.padding(top = 6.dp)) { Text("删除") }
+                    OutlinedButton(onClick = onDelete, modifier = Modifier.weight(1f)) { Text("删除") }
                 }
             }
         }
@@ -973,14 +1158,7 @@ private fun SettingsScreen(vm: AppViewModel) {
     val peerCount = remember(tick) { vm.peersCount() }
     val diagText by vm.diagText.collectAsStateWithLifecycle()
     val diagRunning by vm.diagRunning.collectAsStateWithLifecycle()
-    val savedPassphrase by vm.passphrase.collectAsStateWithLifecycle()
-    val fingerprint by vm.fingerprint.collectAsStateWithLifecycle()
-    var pw by remember { mutableStateOf("") }
-    var pwInit by remember { mutableStateOf(false) }
-    if (!pwInit) {
-        pw = savedPassphrase
-        pwInit = true
-    }
+    val paired by vm.paired.collectAsStateWithLifecycle()
 
     Column(
         Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
@@ -995,7 +1173,7 @@ private fun SettingsScreen(vm: AppViewModel) {
         Text("设备名称：${vm.deviceName()}")
         Text("接收目录：${vm.receiveDir()}", style = MaterialTheme.typography.bodySmall)
         Text("已发现设备：$peerCount 台")
-        Text("协议版本：v3")
+        Text("协议版本：v${Proto.VERSION}")
 
         Text("— 后台运行 —", style = MaterialTheme.typography.labelLarge)
         val context = LocalContext.current
@@ -1026,34 +1204,60 @@ private fun SettingsScreen(vm: AppViewModel) {
             style = MaterialTheme.typography.bodySmall,
         )
 
-        Text("— 加密隧道 —", style = MaterialTheme.typography.labelLarge)
-        var showPw by remember { mutableStateOf(false) }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = pw, onValueChange = { pw = it },
-                label = { Text("隧道口令（两端要一致）") },
-                singleLine = true,
-                // 默认隐藏口令，点右侧「显示」才明文（防止被人瞄到/截屏）
-                visualTransformation = if (showPw) VisualTransformation.None
-                else PasswordVisualTransformation(),
-                trailingIcon = {
-                    TextButton(onClick = { showPw = !showPw }) {
-                        Text(if (showPw) "隐藏" else "显示")
-                    }
-                },
-                modifier = Modifier.weight(1f),
-            )
-            Button(onClick = { vm.savePassphrase(pw) }) { Text("保存") }
+        // 显示版本号：确认「手机上跑的到底是哪个包」——之前反复排查就吃了这个亏
+        val versionName = remember {
+            runCatching {
+                context.packageManager.getPackageInfo(context.packageName, 0).versionName
+            }.getOrNull() ?: "?"
         }
-        // 只显示「加密/未加密」状态 —— 不显示指纹等任何敏感信息
-        if (fingerprint.isEmpty()) {
-            Text("⚠ 未加密：口令为空，同网段任何人都能与本机通信",
-                color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodySmall)
+        Text("大司农 版本：$versionName（数据库版本 7）", style = MaterialTheme.typography.bodySmall)
+
+        // 连接闲置多久后自动关闭（分钟）——「保持长连接」打开时无限期
+        var ctText by remember { mutableStateOf(vm.connTimeoutMinutes().toString()) }
+        OutlinedTextField(
+            value = ctText,
+            onValueChange = {
+                ctText = it.filter { ch -> ch.isDigit() }.take(4)
+                vm.setConnTimeoutMinutes(ctText.toIntOrNull() ?: 10)
+            },
+            label = { Text("连接闲置多少分钟后自动关闭（分钟）") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text("空闲超过该时间会断开（省资源）；打开「保持长连接」则无限期保持，不会被关。",
+            style = MaterialTheme.typography.bodySmall)
+
+        // TCP 并发（1~8）：一次传输并发几条数据连接；配合接口池提速，填 1 = 单连接
+        var ccText by remember { mutableStateOf(vm.concurrency().toString()) }
+        OutlinedTextField(
+            value = ccText,
+            onValueChange = {
+                ccText = it.filter { ch -> ch.isDigit() }.take(1)
+                vm.setConcurrency(ccText.toIntOrNull() ?: 3)
+            },
+            label = { Text("TCP 并发（1~8 条数据连接）") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        Text("— 已配对设备 —", style = MaterialTheme.typography.labelLarge)
+        if (paired.isEmpty()) {
+            Text("还没有配对的设备。首次与某台设备连接时会弹出 6 位数字，两边核对一致即可配对。",
+                style = MaterialTheme.typography.bodySmall)
         } else {
-            Text("已加密", style = MaterialTheme.typography.bodySmall)
+            paired.forEach { row ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(row.name ?: row.deviceId.take(8))
+                        Text("已配对：对方身份已记住", style = MaterialTheme.typography.bodySmall)
+                    }
+                    OutlinedButton(onClick = { vm.unpair(row.deviceId) }) { Text("解绑") }
+                }
+            }
         }
         Text(
-            "提示：两端填同一个口令即可加密；口令只保存在本机，不会显示在其它地方。",
+            "提示：加密**始终开启**（每设备独立身份），不需要设置口令；" +
+                "想让它不再信任某台设备，点上面的「解绑」即可（下次连接要重新配对）。",
             style = MaterialTheme.typography.bodySmall,
         )
         Text(

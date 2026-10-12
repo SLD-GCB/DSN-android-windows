@@ -19,6 +19,10 @@ class EventType(str, Enum):
     TRANSFER_ADDED = "transfer_added"
     TRANSFER_UPDATED = "transfer_updated"
     CONVERSATION_REBOUND = "conversation_rebound"
+    #: 需要用户确认配对：data = {"peer_id","name","sas"}；UI 用 `engine.answer_pairing()` 回
+    PAIR_REQUEST = "pair_request"
+    #: 配对表变化：data = {"peer_id","paired"}
+    PAIRED_CHANGED = "paired_changed"
     LOG = "log"
 
 

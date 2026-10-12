@@ -19,6 +19,10 @@ class ControlConnection(
     val isOutgoing: Boolean,
     private val onMessage: (ControlConnection, JSONObject) -> Unit,
     private val onClose: (ControlConnection) -> Unit,
+    /** 隧道握手阶段**已认证**的对端公钥指纹（v4：配对判定的依据）。 */
+    val peerFp: String = "",
+    /** 本次握手的 nonce（原始字节；配对短码要用它）。 */
+    val peerNonce: ByteArray = ByteArray(0),
 ) {
     private val out = socket.getOutputStream()
     private val input = socket.getInputStream()
@@ -27,6 +31,10 @@ class ControlConnection(
     @Volatile var lastSeen: Long = System.currentTimeMillis()
     @Volatile var lastPong: Long = System.currentTimeMillis()
     @Volatile private var closed = false
+
+    //: 配对协商中：本端用户是否已同意 / 对端是否已同意（**两端都同意才落库**）
+    @Volatile var pairOwnOk: Boolean = false
+    @Volatile var pairPeerOk: Boolean = false
 
     val alive: Boolean get() = !closed
 
@@ -97,33 +105,60 @@ class TransportManager(
 ) {
     private val sessions = ConcurrentHashMap<String, ControlConnection>()
     @Volatile private var server: ServerSocket? = null
+
+    /** 接口池：池里的备用监听口（按需占用、用完归还）。 */
+    private val poolServers = java.util.concurrent.CopyOnWriteArrayList<ServerSocket>()
+
+    /** 接口池分配表：peerId -> (监听口 socket, 端口)。 */
+    private val peerPorts = java.util.concurrent.ConcurrentHashMap<String, Pair<ServerSocket, Int>>()
+
+    /** 接口池大小：主口之外最多再找这么多口。 */
+    private val poolSize = 8
     @Volatile private var running = false
 
     /** 自我介绍（直连握手用）。 */
-    private fun identity(): JSONObject = JSONObject()
+    private fun identity(peerId: String? = null): JSONObject = JSONObject()
         .put("device_id", cfg.deviceId)
         .put("name", cfg.deviceName)
         .put("device_type", cfg.deviceType)
         .put("tcp_port", cfg.tcpPort)
         .put("udp_port", cfg.udpPort)
         .put("proto", Proto.VERSION)
+        // 端口池（v5，**当前只通告不启用**）：对端没有这两个字段时退回单口 tcpPort
+        .put("tcp_ports", org.json.JSONArray().put(peerId?.let { peerPorts[it]?.second } ?: cfg.tcpPort))
+        .put("data_ports", org.json.JSONArray().put(peerId?.let { peerPorts[it]?.second } ?: cfg.tcpPort))
 
     /** 直连结果：会话 / 对方身份 / 错误文案。 */
     class DirectResult(val conn: ControlConnection?, val identity: JSONObject?, val error: String?)
 
-    private fun currentTunnel(): TunnelContext? = try {
-        tunnelProvider?.invoke()
-    } catch (_: Exception) {
-        null
-    }
+    /**
+     * 取当前隧道上下文；`null` = 本机未接线/未配置隧道。
+     *
+     * ⚠ **刻意不吞异常**：provider 抛错意味着"本机加密状态未知"，调用方必须按
+     * fail-closed 处理（拒绝/关闭）。早期版本在这里 `catch { null }`，把异常变成了
+     * "没加密"，于是入站连接会被**按明文放行** —— 那是个真实的安全漏洞。
+     */
+    private fun currentTunnel(): TunnelContext? = tunnelProvider?.invoke()
 
     /**
-     * 服务端侧：口令非空时先包 TLS + 跑隧道握手，之后才是业务首帧。
-     * 返回 null 表示隧道阶段就失败了（socket 已关）。
+     * 服务端侧：包 TLS + 双向签名握手，返回**已认证**的对端信息。
+     *
+     * v4 起**没有明文分支**：拿不到隧道/身份就拒绝（fail-closed）。返回 null 表示
+     * 这一层失败了（socket 已关）。
      */
-    private fun wrapIncoming(raw: Socket): Socket? {
-        val tunnel = currentTunnel() ?: return raw
-        if (!tunnel.enabled) return raw
+    private fun wrapIncoming(raw: Socket): PeerAuth? {
+        val tunnel = try {
+            currentTunnel()
+        } catch (e: Exception) {
+            // 加密状态未知 → 拒绝，绝不退化成明文
+            log("隧道不可用，拒绝入站连接：${e.message}")
+            runCatching { raw.close() }
+            return null
+        } ?: run {
+            log("本机身份不可用，拒绝入站连接")
+            runCatching { raw.close() }
+            return null
+        }
         return try {
             tunnel.accept(raw)
         } catch (e: Exception) {
@@ -131,6 +166,41 @@ class TransportManager(
             runCatching { raw.close() }
             null
         }
+    }
+
+    /**
+     * 从接口池里**按需**取一个空闲口并开始监听；池里没有可用口返回 null（调用方回落主口）。
+     *
+     * ⚠ **不设 reuseAddress**：设了的话，别人占着这个口我们也能"绑成功" → 两条连接串台。
+     * 不设则绑不上就换下一个，永不串台（跳开主口 tcpPort，主口由 start() 常驻）。
+     */
+    private fun acquirePoolPort(): Pair<ServerSocket, Int>? {
+        for (i in 1 until poolSize) {
+            val port = cfg.tcpPort + i
+            val srv = ServerSocket()
+            try {
+                srv.bind(InetSocketAddress(port))
+            } catch (_: Exception) {
+                try { srv.close() } catch (_: Exception) {}
+                continue
+            }
+            poolServers.add(srv)
+            Thread({ acceptLoop(srv) }, "tcp-accept-$port").apply { isDaemon = true }.start()
+            return srv to port
+        }
+        return null
+    }
+
+    private fun assignPoolPort(peerId: String) {
+        if (peerPorts.containsKey(peerId)) return
+        val got = acquirePoolPort() ?: return     // 池满 → 回落主口
+        peerPorts[peerId] = got
+    }
+
+    private fun releasePoolPortFor(peerId: String) {
+        val got = peerPorts.remove(peerId) ?: return
+        try { got.first.close() } catch (_: Exception) {}
+        poolServers.remove(got.first)
     }
 
     fun start() {
@@ -170,7 +240,8 @@ class TransportManager(
     }
 
     private fun handleIncoming(raw: Socket) {
-        val sock = wrapIncoming(raw) ?: return
+        val auth = wrapIncoming(raw) ?: return
+        val sock = auth.sock
         try {
             val frame = FrameCodec.readFrame(sock.getInputStream())
             if (frame == null) {
@@ -186,7 +257,36 @@ class TransportManager(
                     if (peerId.isEmpty() || peerId == cfg.deviceId) {
                         sock.close(); return
                     }
-                    val conn = ControlConnection(cfg, sock, peerId, false, onControl, ::onSessionClose)
+                    // 版本闸门：协议版本不兼容 → 回一条可读错误后断开（不建会话）
+                    val info0 = env.optJSONObject("data") ?: JSONObject()
+                    val remoteProto = env.optInt("proto", 0)
+                    if (remoteProto != 0 && Messages.negotiate(
+                            remoteProto,
+                            info0.optInt("proto_min", remoteProto),
+                            info0.optInt("proto_max", remoteProto),
+                        ) < 0
+                    ) {
+                        runCatching {
+                            val out = sock.getOutputStream()
+                            FrameCodec.writeFrame(
+                                out, FrameType.JSON,
+                                Messages.encode(
+                                    Messages.envelope(
+                                        "error", cfg.deviceId, peerId,
+                                        JSONObject()
+                                            .put("code", "proto")
+                                            .put("message", "协议版本不一致，请把两端都升级到最新版"),
+                                    ),
+                                ),
+                            )
+                            out.flush()
+                        }
+                        sock.close(); return
+                    }
+                    val conn = ControlConnection(
+                        cfg, sock, peerId, false, onControl, ::onSessionClose,
+                        peerFp = auth.fp, peerNonce = auth.nonce,
+                    )
                     register(conn)
                     conn.start()
                     // **任何**入站连接都要把拨号方登记下来（不只是「只知 IP 直连」那条路）：
@@ -201,7 +301,7 @@ class TransportManager(
                     }
                     // 「只知 IP 的直连」再多回一条身份应答（拨号方靠它知道我们是谁）。
                     if (env.optJSONObject("data")?.optBoolean("ip_only") == true) {
-                        conn.send(Messages.envelope("connect_ok", cfg.deviceId, peerId, identity()))
+                        conn.send(Messages.envelope("connect_ok", cfg.deviceId, peerId, identity(peerId)))
                     }
                 }
                 FrameType.DATA_HELLO -> onData(sock, frame.type, frame.body, sock.inetAddress.hostAddress ?: "")
@@ -217,18 +317,30 @@ class TransportManager(
 
     fun connectControl(ip: String, peerId: String, port: Int = cfg.tcpPort): ControlConnection? = try {
         var sock = binder.connectTcpAny(ip, port, Proto.CONNECT_TIMEOUT_MS)
-        // 客户端侧：口令非空时包 TLS + 钉指纹 + 跑握手
-        val tunnel = currentTunnel()
-        if (tunnel != null && tunnel.enabled) {
-            try {
-                sock = tunnel.connect(sock, ip)
-            } catch (e: Exception) {
-                runCatching { sock.close() }
-                log("与 ${peerId.take(8)} 建立加密隧道失败：${e.message}")
-                return null
-            }
+        // 客户端侧：包 TLS + 双向签名握手（v4 无明文分支）
+        val tunnel = try {
+            currentTunnel()
+        } catch (e: Exception) {
+            runCatching { sock.close() }
+            log("隧道不可用，取消连接：${e.message}")
+            return null
+        } ?: run {
+            runCatching { sock.close() }
+            log("本机身份不可用，取消连接")
+            return null
         }
-        val conn = ControlConnection(cfg, sock, peerId, true, onControl, ::onSessionClose)
+        val auth = try {
+            tunnel.connect(sock, ip)
+        } catch (e: Exception) {
+            runCatching { sock.close() }
+            log("与 ${peerId.take(8)} 建立隧道失败：${e.message}")
+            return null
+        }
+        sock = auth.sock
+        val conn = ControlConnection(
+            cfg, sock, peerId, true, onControl, ::onSessionClose,
+            peerFp = auth.fp, peerNonce = auth.nonce,
+        )
         // 握手：**总是**带上自己的身份（deviceId/名字/端口）。老版本读不懂就忽略多余字段，
         // 但这样任何一次入站连接，被叫方都能立刻知道拨号方"现在"的地址和端口 ——
         // 数据连接才有地方可发（热点下 UDP 发现是废的）。
@@ -257,16 +369,25 @@ class TransportManager(
         var sock: Socket? = null
         try {
             var s = binder.connectTcpAny(ip, port, Proto.CONNECT_TIMEOUT_MS)
-            val tunnel = currentTunnel()
-            if (tunnel != null && tunnel.enabled) {
-                try {
-                    s = tunnel.connect(s, ip)
-                } catch (e: Exception) {
-                    runCatching { s.close() }
-                    // 口令不一致时这里就是那句「对方身份对不上」，必须上抛给 UI
-                    return DirectResult(null, null, e.message ?: "口令不一致或对方未开加密")
-                }
+            val tunnel = try {
+                currentTunnel()
+            } catch (e: Exception) {
+                runCatching { s.close() }
+                return DirectResult(null, null, "本机身份状态异常，已取消直连：${e.message}")
+            } ?: run {
+                runCatching { s.close() }
+                return DirectResult(null, null, "本机身份不可用，已取消直连")
             }
+            // 直连要求**短超时**：TLS 与握手都由这个 timeout 兜住（握手完隧道会清掉它）
+            s.soTimeout = timeoutMs
+            val auth = try {
+                tunnel.connect(s, ip)
+            } catch (e: Exception) {
+                runCatching { s.close() }
+                return DirectResult(null, null, e.message ?: "隧道握手失败")
+            }
+            s = auth.sock
+            s.soTimeout = 0
             sock = s
             val data = JSONObject().put("role", "control").put("ip_only", true)
             val me = identity()
@@ -293,7 +414,10 @@ class TransportManager(
                 runCatching { s.close() }
                 return DirectResult(null, null, "对方返回的身份无效")
             }
-            val conn = ControlConnection(cfg, s, peerId, true, onControl, ::onSessionClose)
+            val conn = ControlConnection(
+                cfg, s, peerId, true, onControl, ::onSessionClose,
+                peerFp = auth.fp, peerNonce = auth.nonce,
+            )
             register(conn)
             conn.start()
             return DirectResult(conn, info, null)
@@ -320,12 +444,16 @@ class TransportManager(
                 }
             }
             sessions[conn.peerId] = conn
+            runCatching { assignPoolPort(conn.peerId) }
         }
     }
 
     private fun onSessionClose(conn: ControlConnection) {
         synchronized(sessions) {
-            if (sessions[conn.peerId] === conn) sessions.remove(conn.peerId)
+            if (sessions[conn.peerId] === conn) {
+                sessions.remove(conn.peerId)
+                runCatching { releasePoolPortFor(conn.peerId) }
+            }
         }
     }
 

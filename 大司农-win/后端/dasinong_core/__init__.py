@@ -3,4 +3,4 @@
 纯 stdlib + psutil，Qt 无关，可 headless 测试。
 """
 __all__ = ["config", "models", "protocol", "network", "store", "node", "events"]
-__version__ = "6.1"
+__version__ = "6.38"

@@ -41,6 +41,9 @@ class ControlSession:
         is_outgoing: bool,
         on_message: ControlHandler,
         on_close: Callable[["ControlSession"], None],
+        peer_fp: str = "",
+        peer_spki: bytes = b"",
+        peer_nonce: bytes = b"",
     ) -> None:
         self.cfg = cfg
         self.sock = sock
@@ -48,6 +51,15 @@ class ControlSession:
         self.is_outgoing = is_outgoing
         self.on_message = on_message
         self.on_close = on_close
+        #: 隧道握手阶段**已认证**的对端身份（v4：配对判定的依据）
+        self.peer_fp = peer_fp
+        self.peer_spki = peer_spki
+        self.peer_nonce = peer_nonce
+        #: 本会话是否已完成配对（由 NodeEngine 标注）
+        self.paired = False
+        #: 配对协商中：本端用户是否已同意 / 对端是否已同意
+        self.pair_own_ok = False
+        self.pair_peer_ok = False
 
         self._send_lock = threading.Lock()
         self._stop = threading.Event()
@@ -152,26 +164,96 @@ class TransportManager:
         self._lock = threading.RLock()
         self._server: Optional[socket.socket] = None
         self._stop = threading.Event()
-        self._accept_thread: Optional[threading.Thread] = None
+        # 控制连接**端口池**（v5）：绑上几个算几个，主口必须成功
+        self._servers: list = []
+        self._accept_threads: list = []
+        #: 接口池分配表：peer_id -> (监听socket, port)
+        self._peer_ports: dict = {}
+
+    #: 控制连接**接口池**大小（v5）：池里共这么多口，设备接入就从池里分配一个。
+    _PORT_POOL_SIZE = 8
+
+    def _acquire_pool_port(self):
+        """从接口池里**按需**取一个空闲口并开始监听；池空返回 None。
+
+        ⚠ 关键：**不设 SO_REUSEADDR**。
+        设了的话，别人占着这个口我们也能"绑成功" → 两条连接串台（踩过一次，挂 5 条用例）。
+        不设则绑不上就换下一个，**永不串台**。
+
+        跳过主口（`tcp_port`）——它由 `start()` 常驻，负责"第一次被找到"。
+        """
+        for i in range(1, self._PORT_POOL_SIZE):
+            port = self.cfg.tcp_port + i
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                srv.bind(("", port))
+            except OSError:
+                srv.close()
+                continue                      # 被占/不可用 → 换下一个
+            srv.listen(16)
+            srv.settimeout(1.0)
+            self._servers.append(srv)
+            t = threading.Thread(
+                target=self._accept_loop, args=(srv,), name=f"tcp-accept-{port}", daemon=True
+            )
+            self._accept_threads.append(t)
+            t.start()
+            return srv, port
+        return None, None
+
+    def _assign_pool_port(self, peer_id: str) -> None:
+        """接口池：给这**一台设备**分配一个专属口（已有则复用；池空则回落主口，不分配）。"""
+        if peer_id in self._peer_ports:
+            return
+        srv, port = self._acquire_pool_port()
+        if srv is None:
+            return                       # 池满 → 回落主口
+        self._peer_ports[peer_id] = (srv, port)
+
+    def _release_pool_port_for(self, peer_id: str) -> None:
+        """设备离线 → 归还它那个口（回到池里给别的设备用）。"""
+        ent = self._peer_ports.pop(peer_id, None)
+        if ent is not None:
+            self._release_pool_port(ent[0])
+
+    def _release_pool_port(self, srv) -> None:
+        """归还池里的一个口：关掉监听并移除（accept 线程会因 OSError 自行退出）。"""
+        try:
+            srv.close()
+        except OSError:
+            pass
+        if srv in self._servers:
+            self._servers.remove(srv)
 
     # ------------------------------------------------------------- 服务端
     def start(self) -> None:
+        # ⚠ 端口池**不能用"连续端口 +N"**：多实例/多测试的端口本来就挨着，
+        # A 的备用口会正好是 B 的主口，加上 SO_REUSEADDR 会串台（踩过一次）。
+        # 正确做法：**按需在临时端口（bind 端口 0）上再开监听**，把 OS 分配到的真实端口通告出去。
+        # 见任务 #93；本轮先保持单口（行为不变）。
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("", self.cfg.tcp_port))
         srv.listen(16)
         srv.settimeout(1.0)
+        self._servers = [srv]
         self._server = srv
-        self._accept_thread = threading.Thread(
-            target=self._accept_loop, name="tcp-accept", daemon=True
+        t = threading.Thread(
+            target=self._accept_loop, args=(srv,), name="tcp-accept", daemon=True
         )
-        self._accept_thread.start()
+        self._accept_threads = [t]
+        t.start()
+
+    @property
+    def listen_ports(self) -> list:
+        """当前真正在监听的控制口列表（供端口池通告 `tcp_ports`）。"""
+        return [x.getsockname()[1] for x in self._servers]
 
     def stop(self) -> None:
         self._stop.set()
-        if self._server is not None:
+        for srv in self._servers:
             try:
-                self._server.close()
+                srv.close()
             except OSError:
                 pass
         with self._lock:
@@ -180,11 +262,10 @@ class TransportManager:
         for s in sessions:
             s.close()
 
-    def _accept_loop(self) -> None:
-        assert self._server is not None
+    def _accept_loop(self, srv) -> None:
         while not self._stop.is_set():
             try:
-                conn, addr = self._server.accept()
+                conn, addr = srv.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -198,20 +279,36 @@ class TransportManager:
             ).start()
 
     def current_tunnel(self):
-        """当前的隧道上下文（口令为空则 enabled=False，等价于明文）。"""
+        """当前的隧道上下文；`None` 表示未接线（无加密场景）。
+
+        ⚠ **刻意不吞异常**：provider 抛错说明"本机加密状态未知"，调用方必须
+        fail-closed（拒绝/关闭）。以前这里 `except: return None`，等于把异常
+        悄悄变成"没加密"，会让入站连接**按明文放行**。
+        """
         if self._tunnel_provider is None:
             return None
-        try:
-            return self._tunnel_provider()
-        except Exception:
-            return None
+        return self._tunnel_provider()
 
     def _handle_incoming(self, conn: socket.socket, addr: tuple) -> None:
-        # 隧道：口令非空时，先包 TLS 并跑握手，之后才是业务首帧
-        tunnel = self.current_tunnel()
+        # 隧道：本机启用加密时，先包 TLS 并跑握手，之后才是业务首帧
+        try:
+            tunnel = self.current_tunnel()
+        except Exception as exc:
+            # 加密状态未知 → 拒绝，绝不退化成明文
+            self.bus.publish(EventType.LOG, f"隧道不可用，拒绝入站连接（{addr[0]}）：{exc}")
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        peer_fp = ""
+        peer_spki = b""
+        peer_nonce = b""
         if tunnel is not None and getattr(tunnel, "enabled", False):
             try:
-                conn = tunnel.accept(conn)
+                auth = tunnel.accept(conn)
+                conn = auth.sock
+                peer_fp, peer_spki, peer_nonce = auth.fp, auth.pub_der, auth.nonce
             except Exception as exc:
                 self.bus.publish(EventType.LOG, f"隧道握手失败（{addr[0]}）：{exc}")
                 try:
@@ -237,9 +334,30 @@ class TransportManager:
             if not peer_id or peer_id == self.cfg.device_id:
                 conn.close()
                 return
+            # 版本闸门：对端协议版本不兼容 → 回一条可读错误后断开（不建会话）
+            data = env.get("data") or {}
+            remote_proto = int(env.get("proto") or 0)
+            if remote_proto and messages.negotiate(
+                remote_proto,
+                int(data.get("proto_min") or remote_proto),
+                int(data.get("proto_max") or remote_proto),
+            ) < 0:
+                try:
+                    write_frame(
+                        conn, FrameType.JSON,
+                        messages.encode(messages.envelope(
+                            "error", self.cfg.device_id, peer_id,
+                            {"code": "proto", "message": "协议版本不一致，请把两端都升级到最新版"},
+                        )),
+                    )
+                except (OSError, ProtocolError):
+                    pass
+                conn.close()
+                return
             sess = ControlSession(
                 self.cfg, conn, peer_id, is_outgoing=False,
                 on_message=self.on_control, on_close=self._on_session_close,
+                peer_fp=peer_fp, peer_spki=peer_spki, peer_nonce=peer_nonce,
             )
             self._register(sess)
             sess.start()
@@ -257,7 +375,7 @@ class TransportManager:
             # 「只知 IP 的直连」再多回一条身份应答（拨号方靠它知道我们是谁）。
             if (env.get("data") or {}).get("ip_only"):
                 sess.send(messages.envelope(
-                    "connect_ok", self.cfg.device_id, peer_id, self._identity(),
+                    "connect_ok", self.cfg.device_id, peer_id, self._identity(peer_id),
                 ))
         elif ftype == FrameType.DATA_HELLO:
             try:
@@ -281,11 +399,24 @@ class TransportManager:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        # 隧道：口令非空时先包 TLS + 握手，握手通过才发业务首帧
-        tunnel = self.current_tunnel()
+        # 隧道：本机启用加密时先包 TLS + 握手，握手通过才发业务首帧
+        try:
+            tunnel = self.current_tunnel()
+        except Exception as exc:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self.bus.publish(EventType.LOG, f"本机加密状态异常，取消连接：{exc}")
+            return None
+        peer_fp = ""
+        peer_spki = b""
+        peer_nonce = b""
         if tunnel is not None and getattr(tunnel, "enabled", False):
             try:
-                sock = tunnel.connect(sock, ip)
+                auth = tunnel.connect(sock, ip)
+                sock = auth.sock
+                peer_fp, peer_spki, peer_nonce = auth.fp, auth.pub_der, auth.nonce
             except Exception as exc:
                 try:
                     sock.close()
@@ -296,6 +427,7 @@ class TransportManager:
         sess = ControlSession(
             self.cfg, sock, peer_id, is_outgoing=True,
             on_message=self.on_control, on_close=self._on_session_close,
+            peer_fp=peer_fp, peer_spki=peer_spki, peer_nonce=peer_nonce,
         )
         # 握手：**总是**带上自己的身份（device_id/名字/端口）。
         # 老版本读不懂就忽略多余字段（协议里规定未知字段要忽略），不影响兼容；
@@ -312,8 +444,14 @@ class TransportManager:
         sess.start()
         return sess
 
-    def _identity(self) -> dict:
-        """回给拨号方的自我介绍（直连用）。"""
+    def _identity(self, peer_id: Optional[str] = None) -> dict:
+        """回给拨号方的自我介绍（直连用）。
+
+        `tcp_ports`：接口池**给这台设备分配的口**（有就只给这一个，让它走专属口）；
+        没分配（池满/首次）则给主口 `tcp_port`。
+        """
+        ent = self._peer_ports.get(peer_id) if peer_id else None
+        _ports = [ent[1]] if ent else [self.cfg.tcp_port]
         return {
             "device_id": self.cfg.device_id,
             "name": self.cfg.device_name,
@@ -321,6 +459,9 @@ class TransportManager:
             "tcp_port": self.cfg.tcp_port,
             "udp_port": self.cfg.udp_port,
             "proto": PROTO_VERSION,
+            # 端口池（v5，**当前只通告不启用**）：对端没有这两个字段时退回单口 tcp_port
+            "tcp_ports": _ports,
+            "data_ports": _ports,
         }
 
     def connect_direct(
@@ -341,16 +482,30 @@ class TransportManager:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        tunnel = self.current_tunnel()
+        try:
+            tunnel = self.current_tunnel()
+        except Exception as exc:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return None, None, f"本机加密状态异常，已取消直连：{exc}"
+        peer_fp = ""
+        peer_spki = b""
+        peer_nonce = b""
         if tunnel is not None and getattr(tunnel, "enabled", False):
             try:
-                sock = tunnel.connect(sock, ip)
+                # 直连要求**短超时**：TLS 与握手都由这个 timeout 兜住（握手完隧道会清掉它）
+                sock.settimeout(timeout)
+                auth = tunnel.connect(sock, ip)
+                sock = auth.sock
+                peer_fp, peer_spki, peer_nonce = auth.fp, auth.pub_der, auth.nonce
             except Exception as exc:
                 try:
                     sock.close()
                 except OSError:
                     pass
-                # 口令不一致时这里就是那句「对方身份对不上」；必须上抛给 UI
+                # 隧道/身份认证失败的原因必须上抛给 UI
                 return None, None, str(exc)
 
         hello = messages.envelope(
@@ -394,6 +549,7 @@ class TransportManager:
         sess = ControlSession(
             self.cfg, sock, peer_id, is_outgoing=True,
             on_message=self.on_control, on_close=self._on_session_close,
+            peer_fp=peer_fp, peer_spki=peer_spki, peer_nonce=peer_nonce,
         )
         self._register(sess)
         sess.start()
@@ -416,11 +572,15 @@ class TransportManager:
                     sess.close()       # 否则丢弃新连接
                     return
             self._sessions[sess.peer_id] = sess
+        # 接口池：这台设备接入 → 从池里给它分一个专属口（池空则回落主口）
+        self._assign_pool_port(sess.peer_id)
 
     def _on_session_close(self, sess: ControlSession) -> None:
         with self._lock:
             if self._sessions.get(sess.peer_id) is sess:
                 del self._sessions[sess.peer_id]
+        # 设备离线 → 归还专属口
+        self._release_pool_port_for(sess.peer_id)
 
     def get_session(self, peer_id: str) -> Optional[ControlSession]:
         with self._lock:

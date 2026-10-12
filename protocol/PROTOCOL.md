@@ -1,4 +1,4 @@
-# 大司农 通信协议 v3
+# 大司农 通信协议 v4
 
 > 本文件是 Android 端与 Windows 端**唯一事实源**。任何协议改动必须两端同步，并递增 `PROTO_VERSION`（破坏性改动才递增；向后兼容的改动不动版本号，靠"忽略未知"规则）。
 
@@ -12,8 +12,9 @@
 
 | 名称 | 值 | 说明 |
 |---|---|---|
-| `PROTO_VERSION` | `3` | 协议版本 |
-| `PROTO_MIN` | `1` | 本实现支持的最低版本 |
+| `PROTO_VERSION` | `5` | 协议版本（v5 = 端口池 `tcp_ports`/`data_ports` + 直连为先，**向后兼容**） |
+| `PROTO_MIN` | `4` | 最低可互通版本；**v4↔v5 必须能互通**（缺端口池字段就退回单口） |
+| `PROTO_MIN` | `4` | 本实现支持的最低版本（低于它 = 不兼容，只显示不拨号） |
 | `UDP_DISCOVERY_PORT` | `37020` | 广播/多播/网关中继的 UDP 端口 |
 | `TCP_PORT` | `37021` | 每设备 TCP 服务端口（控制 + 数据共用） |
 | `MULTICAST_GROUP` | `224.0.0.167` | 多播回退组地址 |
@@ -50,7 +51,7 @@ len = len(body) + 1
 | type | 名称 | body |
 |---|---|---|
 | `0x01` | `JSON` | UTF-8 JSON（控制报文，见 §4/§5） |
-| `0x03` | `AUTH_HELLO` | 隧道握手：`{"nonce":"<hex>"}`（见 §0.5） |
+| `0x03` | `AUTH_HELLO` | 隧道握手：`{"nonce":"<hex>"}`（见 §2.5） |
 | `0x04` | `AUTH_REQ` | 隧道握手：`{"mac":"<hex>"}` |
 | `0x05` | `AUTH_RES` | 隧道握手：`{"mac2":"<hex>"}` |
 | `0x06` | `AUTH_ERR` | 隧道握手失败：`{"错":"..."}` |
@@ -64,44 +65,60 @@ len = len(body) + 1
 - 读 `len` 后若 `len > MAX_FRAME` 或 `len < 1` → 视为协议错误，断开连接。
 - 未知 `type` → 读满 `len-1` 字节后**丢弃该帧**并继续读下一帧。
 
-## 2.5 传输层安全（加密隧道 dsn-tunnel v3）
+## 2.5 传输层安全（加密隧道 dsn-tunnel v4）
 
-设计参照 honglu-tunnel v1（`ai酒馆/酒馆隧道.py` + `鸿胪寺/后端/隧道.kt`）：**密码学一行不自己造**。
+**密码学一行不自己造**：加密用标准 **TLS**（Python `ssl` / Android `SSLSocket`），
+优先 TLS 1.3、允许回退 1.2（Android 26~28 最高只到 1.2）。
 
-**加密**：每条 TCP 连接（控制 + 数据）套标准 **TLS**（Python `ssl` / Android `SSLSocket`）。
-优先 TLS 1.3，允许回退 1.2（Android 26~28 最高只到 1.2）。
-
-**身份**：口令派生（两端**同一口令 → 同一把密钥 → 同一指纹**），无需扫码/比对/手输指纹。
+**身份 = 每设备独立密钥**（v4 起，**不再由口令派生**）：
 
 | 项 | 值 |
 |---|---|
-| 盐 | `dasinong-tunnel-v1` |
-| KDF | PBKDF2-HMAC-SHA256，**200000** 次迭代，输出 32B |
-| 曲线 | P-256 (secp256r1)；标量 `d = (int(材料) mod (n-1)) + 1` |
-| 证书 | 自签，CN `dasinong-tunnel`，SHA256withECDSA，随机序列号，10 年 |
+| 身份 | 首次运行生成 **32 字节随机种子** → P-256 私钥 |
+| 标量 | `d = (int(seed) mod (n-1)) + 1`（`n` = P-256 阶） |
+| 证书 | 自签，CN `dasinong-identity`，SHA256withECDSA，随机序列号，10 年 |
 | 指纹 | **SPKI DER 的 SHA-256**（小写 hex）。⚠ 不是整张证书的哈希 |
+| 私钥保护 | Windows：DPAPI（绑定当前用户）；Android：系统密钥库 AES-GCM |
 
-客户端侧**只认这个公钥指纹**：口令不一致的人连不上，也冒充不了。
-口令为空 → 不加密（见下）。
+**两侧都不预知对端指纹**（对端身份事先不知道），所以：
 
-**TLS 之上再做一道 HMAC 双向认证**（用于给出明确的「口令不一致」报错）：
+- TLS 层**不校验证书链**（它只负责机密性与完整性）；
+- 真正的身份证明放在**应用层**：双方各自用自己的私钥对 `方向|nonce|对端指纹` 签名，
+  对方用**它声明的公钥**验签。nonce 防重放、对端指纹防中继/降级。
+
 ```
-服务端 → DSN1                      (4 字节 magic)
-服务端 → AUTH_HELLO {nonce}        (0x03)
-客户端 → AUTH_REQ  {mac}           (0x04)   mac  = HMAC-SHA256(k_auth, "client|" + nonce)
-服务端 → AUTH_RES  {mac2}          (0x05)   mac2 = HMAC-SHA256(k_auth, "server|" + nonce)
+服务端 → DSN1                       (4 字节 magic)
+服务端 → AUTH_HELLO {nonce, fp}      (0x03)   fp = 服务端自报的指纹
+客户端 → AUTH_REQ  {fp, pub, sig}    (0x04)   sig = ECDSA(client_priv, "client|" + nonce + "|" + fp_server)
+服务端 → AUTH_RES  {fp, pub, sig}    (0x05)   sig = ECDSA(server_priv, "server|" + nonce + "|" + fp_client)
+服务端 → AUTH_ERR  {code, 错}        (0x06)   握手/身份校验失败
 ```
-握手通过后才允许发业务首帧（`connect` / `DATA_HELLO`）。
 
-**口令密钥（域分离）**：
-`key(用途) = PBKDF2-HMAC-SHA256(口令, 盐 + "|" + 用途, 200000, 32)`
-  · 用途 `hello` → 发现报文签名。⚠ 广播是**明文**，必须走 PBKDF2，否则等于把
-    "口令原文做 HMAC"暴露成可离线爆破的口令预言机。
-  · 用途 `auth`  → AUTH 握手。
-身份派生用**不带用途后缀**的 `PBKDF2(口令, 盐)`。
+- `pub` 是 base64 的 SPKI DER；接收方必须校验 `SHA256(pub) == fp`，否则拒绝。
+- 客户端会把服务端**自报的 fp** 纳入自己的签名，服务端核对自己是否真是它 → 防中继。
 
-**口令为空 = 不加密**：不套 TLS、不跑握手，走明文 TCP。
-本机口令非空时会忽略未签名的发现报文（见 §4.1），所以口令不一致的两台设备**互相看不见**。
+**握手只证明"你持有你自称的那把钥匙"**；是否**信任**由**配对表**决定（见 §2.6）。
+
+**没有明文模式**：本机拿不到身份/隧道就**拒绝连接**（fail-closed），绝不退化成明文 TCP。
+
+## 2.6 配对（首次连接的人工确认）
+
+配对表（`paired`）以 `device_id` 为主键，存对端指纹、名字、首/末次时间与 `trusted`。
+
+- 控制通道建立后，**拨号方**发 `pair_request{name}`；两端各自算出**同一个 6 位短码**：
+
+```
+digest = SHA-256("dasinong-sas-v1" || 较小指纹 || 较大指纹 || nonce)   # 指纹取原始 32 字节
+code   = 大端无符号(digest[0:4]) % 1_000_000        # 左补零到 6 位
+```
+
+- 两端弹窗显示该短码；**核对一致**后各点一次「配对」（各自回 `pair_accept`）；
+  **两端都同意**才写 `paired`（不产生"半信任"），随后互发 `pair_ok`。
+- 任一端取消 → `pair_reject` → 断开；60 秒无人确认 → 视为拒绝。
+- **未配对的 peer，业务帧一律拒绝**（回 `error{code:"unpaired"}`，仅放行 `ping/pong` 与配对报文）。
+- 解绑：删本机那条记录（**单侧语义**），下次连接重新配对。
+
+> ⚠ 界面**只显示这 6 位短码**，不显示任何指纹（用户硬要求）；短码是本次会话的临时值。
 
 ## 3. JSON 信封
 
@@ -144,11 +161,10 @@ UDP 发现报文、网关中继报文、TCP 控制报文共用同一信封：
 ```
 `device_type` ∈ `android` | `windows`。
 
-**`enc` / `mac`（v3 新增，仅当本机口令非空时携带）**：
-`mac = HMAC-SHA256(口令, "from|name|device_type|tcp_port|udp_port|ts")`，
-字段顺序固定、以 `|` 连接（见 `network/tunnel.py::hello_fields`）。
-接收方口令非空时，**未带有效 mac 的 hello 一律忽略**（防同网段伪造设备冒进列表）；
-口令为空时不做校验（兼容明文模式）。
+**`enc` / `pub` / `sig`（v4）**：`enc=1` 表示本机已启用加密；`pub` 是 base64 的 **SPKI DER**，
+`sig` = `ECDSA-SHA256(设备私钥, "from|name|device_type|tcp_port|udp_port|ts")`（字段固定、`|` 连接，
+见 `network/tunnel.py::hello_fields`）。接收方**必须**用 `pub` 验 `sig`，验不过就丢弃
+（防同网段伪造设备冒进列表）；`sig` 覆盖 `from`，顺带防了 `device_id` 冒用。
 
 ### 4.2 `bye`
 ```json
@@ -214,7 +230,8 @@ u16 code (BE) + utf8 message
 {"proto":3,"type":"connect","id":"...","from":"...","to":"...","ts":0,
  "data":{"role":"control",
          "device_id":"<拨号方>","name":"客厅手机","device_type":"android",
-         "tcp_port":37021,"udp_port":37020,"proto":3}}
+         "tcp_port":37021,"udp_port":37020,"proto":5,
+         "tcp_ports":[37021],"data_ports":[37021]}}
 ```
 
 `data` 里**始终**带上拨号方自己的身份（`device_id` 与 `from` 相同，其余为展示/端口信息）。
@@ -263,7 +280,11 @@ u16 code (BE) + utf8 message
 | `complete` | 发→收 | `{transfer_id, file_id}` | 某文件发送完毕 |
 | `done` | 收→发 | `{transfer_id, file_id}` | 校验并落盘完成 |
 | `cancel` | 双向 | `{transfer_id, file_id?, reason}` | 取消 |
-| `error` | 双向 | `{transfer_id?, file_id?, code, message}` | 错误 |
+| `error` | 双向 | `{transfer_id?, file_id?, code, message}` | 错误；`code` 可为 `proto`（版本不兼容）/`unpaired`（未配对，见 §2.6） |
+| `pair_request` | 拨号→被叫 | `{name}` | 请求配对（见 §2.6） |
+| `pair_accept` | 双向 | `{}` | 本端用户同意配对 |
+| `pair_reject` | 双向 | `{}` | 本端用户拒绝配对（断开） |
+| `pair_ok` | 双向 | `{fp}` | 本端已落库，通知对端完成 |
 | `ping` / `pong` | 双向 | `{}` | 保活 |
 
 ### 7.3 `offer.files[]` 单项
@@ -334,13 +355,53 @@ A(发送)                                         B(接收)
 
 ## 11. 版本协商
 
-- `hello` 携带 `proto`、`proto_min`、`proto_max`。
-- 有效版本 = `min(a.proto, b.proto)`，且须落在对方 `[proto_min, proto_max]` 内。
-- 若 `remote.proto_max < local.proto_min` → 标记 peer 不兼容，禁用传输并在 UI 提示。
-- 向后兼容改动（新增可选字段/报文类型）**不**递增 `proto`。
+- `hello` 携带 `proto`、`proto_min`、`proto_max`；`connect` 信封也带 `proto`。
+- 有效版本 = `min(local.proto, remote.proto_max)`，且须 `>= remote.proto_min` 且 `>= local.proto_min`；
+  否则视为**不兼容**。
+- **不兼容的处理（已实现，不再是纸面约定）**：
+  1. 发现层把该 peer 登记进列表并标 `incompatible=true`，**不拨号**，UI 显示"需升级"；
+  2. 拨号侧对已知过旧的对端直接返回可读错误；
+  3. 入站收到 `connect` 时若版本不兼容 → 回 `error{code:"proto"}` 并断开，不建会话。
+- 向后兼容改动（新增可选字段/报文类型）**不**递增 `proto`；破坏性改动才递增，
+  且两端必须**同时升级**（v4 起 `PROTO_MIN = 4`，即不兼容 v3 及更早）。
 
-## 12. 安全（v1/v2 说明）
+## 12. 安全模型
 
-- 无鉴权、开放局域网；仅响应同子网来源，避免误连外网。
-- README/UI 明示"同网段任何人可见/可发"。
-- 预留升级点：共享 PIN 派生 HMAC 校验 `hello`/`connect`，或 TLS（届时递增 `proto`）。
+- **强制加密**：引擎在**未设置口令时不启动任何网络功能**（不监听、不广播）。
+  也就是说本协议不存在可用的明文模式；"口令为空 = 明文"只保留在隧道模块内部，
+  供单元测试构造环回使用，**运行期不会被走到**。
+- 加密与身份见 §2.5（TLS + 口令派生身份 + 公钥指纹钉死 + AUTH 双向认证）。
+- 发现报文在口令非空时带 HMAC 签名，**口令不一致的两端互相看不见**（§4.1）。
+- 已知局限（v3）：口令是**共享身份**（同口令 = 同指纹），协议无法区分具体哪一台设备；
+  设备名 / IP / 在线状态等元信息仍以明文广播。想区分设备需每设备独立身份（计划中的 v4）。
+- **每设备独立身份** + **首次配对确认**（6 位短码人工核对，见 §2.6）：能区分具体哪台设备、可解绑；
+  未配对的 peer 无法收发业务数据。
+- 私钥以**加密形式**保存在本机（Windows：DPAPI 绑定当前用户；Android：系统密钥库），不落明文。
+- ⚠ 换机 / 重装 / 清数据 / 换 Windows 用户 → 身份换新 → 对端需**重新配对**（会提示「身份已变更」）。
+
+
+## 9. 端口池（v5）
+
+**字段**（出现在**所有身份通告**里：`connect` 的信封 `data`、`connect_ok`、`hello`）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `tcp_ports` | **控制连接**可用端口池（数组；首项即主口 `tcp_port`） |
+| `data_ports` | **数据连接**可用端口池（数组） |
+
+**规则**
+
+1. **直连为先**：发现/连接**一律用 TCP 直连**（安卓与 Windows 的网卡/广播行为不一致，广播不可依赖）。
+   UDP 广播只作**可选加速**，任何"必须先收到广播才能工作"的路径都不允许。
+2. **选口**：拨号方从对端 `tcp_ports` 里挑**占用最少**的口连控制连接；
+   数据连接按 `data_ports` 并发开多条（并发数见设置页「TCP 并发」）。
+3. **回退（必须）**：对端**没有**这两个字段 → 退回单口 `tcp_port`（老版本照常互通）。
+   同理 `data_ports` 缺失时，数据走原有单口隧道。
+4. **版本**：`PROTO_VERSION = 5`、`PROTO_MIN = 4`；两端 `negotiate` 允许 **4↔5 互通**。
+
+**设置页（两端）**
+
+| 项 | 类型 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| 「TCP 并发」 | 数字（1~8） | 3 | 并发几条数据连接；填 1 = 单连接 |
+| 「UDP 传输」 | 开关 | 关 | **大文件走 UDP 直连**（点对点，不做广播）；需自建可靠层（分片/重传/排序/限速） |

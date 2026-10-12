@@ -28,6 +28,7 @@ from dasinong_core.config import Config, load_or_create_device_id  # noqa: E402
 from dasinong_core.events import EventBus, EventType  # noqa: E402
 from dasinong_core.models import ChatMessage, MsgKind  # noqa: E402
 from dasinong_core.node import NodeEngine  # noqa: E402
+from dasinong_core.store import Store  # noqa: E402
 
 TEST_UDP_PORT = 37030
 
@@ -54,6 +55,8 @@ def make_engine(name: str, tcp_port: int, data_dir: Path,
     （比如验证「错口令不该互相发现」时会被这个干扰）。所以每个实例先清空记忆。
     """
     engine = NodeEngine(make_config(name, tcp_port, data_dir, udp_port))
+    # v4 起配对表存在 SQLite 里（`paired`），没有 store 就没法配对 —— 自测也要挂一个
+    engine.attach_store(Store(data_dir / "smoke.db"))
     engine._known_peers = {}
     return engine
 
@@ -90,25 +93,19 @@ class Collector:
 
 
 def main() -> int:
-    # 口令模式：默认带口令（加密）；DASINONG_SMOKE_PLAIN=1 时用空口令（明文）跑
-    plain = os.environ.get("DASINONG_SMOKE_PLAIN") == "1"
-    passphrase = "" if plain else os.environ.get("DASINONG_SMOKE_PW", "smoke-pass-2026")
+    # v4：没有"口令"了 —— 每台设备有**独立身份**，首次连接要**配对**（两端核对同一个 6 位数字）。
+    # 无头环境里没人点按钮，所以用配对模块专门留给自测的开关自动接受。
+    os.environ.setdefault("DASINONG_PAIR_AUTO", "1")
 
     tmp = Path(tempfile.mkdtemp(prefix="dasinong-smoke-"))
     a_dir = tmp / "A"
     b_dir = tmp / "B"
     a = make_engine("Win-A", 37031, a_dir)
     b = make_engine("Win-B", 37032, b_dir)
-    a.set_passphrase(passphrase)
-    b.set_passphrase(passphrase)
     ca, cb = Collector(a), Collector(b)
-    mode = "明文（口令为空）" if plain else "加密（口令已设置）"
 
     try:
-        print(f"[0] 隧道模式：{mode}")
-        if not plain:
-            assert a.fingerprint() == b.fingerprint(), "同口令的两端指纹必须一致"
-            print(f"    本机指纹：{a.fingerprint()[:32]}…")
+        print("[0] 隧道：强制加密（每设备独立身份；首次连接自动配对）")
         a.start()
         b.start()
 
@@ -128,6 +125,16 @@ def main() -> int:
             print("    FAIL: 控制连接未建立（可能是 Windows 防火墙拦截入站）")
             return 1
         print("    OK: 控制连接已建立")
+
+        print("    等待配对完成 ...")
+        paired = wait_for(
+            lambda: a.is_paired(peer_in_b.device_id) and b.is_paired(a.cfg.device_id),
+            timeout=15,
+        )
+        if not paired:
+            print("    FAIL: 配对未完成（v4 起未配对不能收发业务数据）")
+            return 1
+        print("    OK: 已配对（两端各显示同一个 6 位数字，自测里自动接受）")
 
         print("[3] 文本消息 A -> B ...")
         text = "你好，大司农！hello 123"
@@ -252,7 +259,6 @@ def main() -> int:
         # B 必须落成 two.bin 与 two (1).bin 两个文件，且内容分别对应 ——
         # 这正是「两台手机同时发同名照片给电脑」的场景。
         c2 = make_engine("Win-C2", 37033, tmp / "C2")
-        c2.set_passphrase(passphrase)
         c2.start()
         try:
             if not wait_for(
@@ -299,28 +305,15 @@ def main() -> int:
         finally:
             c2.stop()
 
-        print("\n[10] 口令不一致必须互相看不见（防冒充）...")
-        if plain:
-            print("    （明文模式跳过）")
-        else:
-            # 用另一个 UDP 端口隔离，避免和 A/B 互相发现
-            NP = 37040
-            c = make_engine("Win-C", 37041, tmp / "C", udp_port=NP)
-            d = make_engine("Win-D", 37042, tmp / "D", udp_port=NP)
-            c.set_passphrase("完全不同的口令-xyz")
-            d.set_passphrase(passphrase)
-            try:
-                c.start()
-                d.start()
-                time.sleep(8)
-                seen = len(c.peers()) + len(d.peers())
-                if seen != 0:
-                    print(f"    FAIL: 错口令的两端不应互相发现，实际看到 {seen} 台")
-                    return 1
-                print("    OK: 口令不一致 → 双方都看不到对方（广播签名被拒）")
-            finally:
-                c.stop()
-                d.stop()
+        print("\n[10] 解绑：删掉本机对该设备的信任记录 ...")
+        # 注意解绑是**单侧**语义：只删本机这条信任记录（对端的记录由对端自己删）。
+        # 自测里开着自动配对，断线重连后会立刻重新配对 —— 所以这里**立刻查库**，
+        # 验证的是"记录确实被删掉"这个动作本身。
+        a.unpair(b.cfg.device_id)
+        if a.store.pair_get(b.cfg.device_id) is not None:
+            print("    FAIL: 解绑后库里仍有该设备的信任记录")
+            return 1
+        print("    OK: 信任记录已删除；此后未配对状态下业务帧会被拒（需重新配对）")
 
         print("\nALL PASSED")
         return 0

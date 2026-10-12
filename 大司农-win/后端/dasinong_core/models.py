@@ -46,6 +46,8 @@ class Peer:
     device_type: str = "windows"
     proto: int = 2
     encrypted: bool = False
+    #: 协议版本对不上（协商失败）：可以**看见**对方，但不拨号、不通信，UI 提示需升级
+    incompatible: bool = False
     last_seen: float = field(default_factory=time.time)
     state: PeerState = PeerState.DISCOVERED
 

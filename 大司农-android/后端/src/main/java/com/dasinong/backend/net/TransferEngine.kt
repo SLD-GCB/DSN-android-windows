@@ -17,6 +17,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.io.RandomAccessFile
 import java.net.Socket
@@ -108,6 +109,9 @@ class TransferEngine(
     /** 需要控制连接时回调（让引擎立刻重连，而不是等下一次退避）。 */
     private val needSession: ((String) -> Unit)? = null,
 ) {
+    /** 「TCP 并发」：一次传输并发几条数据连接（1~8）。由 NodeEngine 按设置写入，立刻生效。 */
+    @Volatile var maxParallel: Int = Proto.DEFAULT_PARALLEL
+
     private class SendFile(val entry: FileEntry, val source: LocalFile) {
         val remaining = CopyOnWriteArrayList<LongRange>()
         @Volatile var sent: Long = 0
@@ -279,7 +283,8 @@ class TransferEngine(
                 sf.completed = true
                 continue
             }
-            val slots = maxOf(1, minOf(Proto.DEFAULT_PARALLEL, countPieces(sf.remaining, sf.entry.chunkSize)))
+            // 「TCP 并发」（设置页）：1~8；填 1 = 单连接（与旧行为一致）
+            val slots = maxOf(1, minOf(maxParallel.coerceIn(1, Proto.MAX_PARALLEL), countPieces(sf.remaining, sf.entry.chunkSize)))
             repeat(slots) {
                 val t = Thread({ sendWorker(task, sf, peer) }, "sendw-${sf.entry.fileId.take(6)}")
                 t.isDaemon = true
@@ -302,18 +307,35 @@ class TransferEngine(
         }
     }
 
-    private fun currentTunnel(): TunnelContext? = try {
-        tunnelProvider?.invoke()
-    } catch (_: Exception) {
-        null
-    }
+    /**
+     * 取当前隧道上下文；`null` = 本机未接线/未配置隧道。
+     * ⚠ 刻意不吞异常：加密状态未知时必须 fail-closed，不能退化成明文。
+     */
+    private fun currentTunnel(): TunnelContext? = tunnelProvider?.invoke()
 
-    /** 开一条数据连接；口令非空时包 TLS + 握手。 */
+    /**
+     * 开一条数据连接；本机启用加密时包 TLS + 握手。
+     *
+     * 失败一律**抛异常**（调用方会把它记进传输状态），绝不回退成明文 ——
+     * 数据连接与控制连接必须同等 fail-closed。
+     */
     private fun openDataSocket(ip: String, port: Int): Socket {
-        var sock = binder.connectTcpAny(ip, port, Proto.CONNECT_TIMEOUT_MS)
-        val tunnel = currentTunnel()
-        if (tunnel != null && tunnel.enabled) sock = tunnel.connect(sock, ip)
-        return sock
+        val sock = binder.connectTcpAny(ip, port, Proto.CONNECT_TIMEOUT_MS)
+        val tunnel = try {
+            currentTunnel()
+        } catch (e: Exception) {
+            runCatching { sock.close() }
+            throw IOException("本机身份状态异常，已取消数据连接：${e.message}", e)
+        } ?: run {
+            runCatching { sock.close() }
+            throw IOException("本机身份不可用，已取消数据连接")
+        }
+        return try {
+            tunnel.connect(sock, ip).sock
+        } catch (e: Exception) {
+            runCatching { sock.close() }
+            throw IOException("数据连接隧道失败：${e.message}", e)
+        }
     }
 
     private fun sendWorker(task: SendTask, sf: SendFile, peer: Peer) {
@@ -423,7 +445,7 @@ class TransferEngine(
                 JSONObject()
                     .put("transfer_id", tid)
                     .put("files", acceptArr)
-                    .put("max_parallel", Proto.DEFAULT_PARALLEL)
+                    .put("max_parallel", maxParallel.coerceIn(1, Proto.MAX_PARALLEL))
                     .put("window_bytes", Proto.WINDOW_BYTES),
             ),
         )

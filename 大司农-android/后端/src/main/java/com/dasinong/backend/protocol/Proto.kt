@@ -12,8 +12,9 @@ import java.nio.charset.StandardCharsets
  * 帧格式：u32 len(BE) + u8 type + body，len = body.size + 1
  */
 object Proto {
-    const val VERSION = 3
-    const val MIN_VERSION = 1
+    // v4：每设备独立身份 + 配对确认（破坏性改动 —— 旧版客户端连不上）
+    const val VERSION = 5
+    const val MIN_VERSION = 4
 
     const val UDP_PORT = 37020
     const val TCP_PORT = 37021

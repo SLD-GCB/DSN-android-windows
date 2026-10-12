@@ -27,7 +27,7 @@ from ..protocol.constants import (
     PROTO_VERSION,
 )
 from . import interfaces as ifaces_mod
-from .tunnel import hello_fields
+from .tunnel import hello_fields, verify_hello
 
 _GW_TYPES = {"gw_hello", "gw_ack", "gw_register", "gw_peer_list", "gw_goodbye"}
 _REPLY_MIN_INTERVAL = 2.0
@@ -178,7 +178,9 @@ class DiscoveryService:
         tunnel = self._current_tunnel()
         if tunnel is not None and getattr(tunnel, "enabled", False):
             data["enc"] = 1
-            data["mac"] = tunnel.sign_hello(hello_fields(
+            # v4：带**本机公钥**与**设备私钥签名**（不再有口令派生的 HMAC）
+            data["pub"] = tunnel.spki_b64
+            data["sig"] = tunnel.sign_hello(hello_fields(
                 self.cfg.device_id, self.cfg.device_name, self.cfg.device_type,
                 self.cfg.tcp_port, self.cfg.udp_port, ts,
             ))
@@ -289,19 +291,21 @@ class DiscoveryService:
         data = env.get("data") or {}
         encrypted = bool(data.get("enc"))
 
-        # 本机已启用加密 → 只认签名正确的 hello（防同网段伪造设备冒进列表）
+        # v4：hello 用**设备私钥**签名（`pub`/`sig`）。验不过就丢弃 —— 防同网段伪造设备冒进列表。
+        # `sig` 覆盖 `from`，所以顺带防了 device_id 冒用。
         tunnel = self._current_tunnel()
         if tunnel is not None and getattr(tunnel, "enabled", False):
-            mac = str(data.get("mac") or "")
-            expect = tunnel.sign_hello(hello_fields(
+            fields = hello_fields(
                 did,
                 data.get("name") or "",
                 data.get("device_type", "windows"),
                 int(data.get("tcp_port", 37021)),
                 int(data.get("udp_port", self.cfg.udp_port)),
                 int(data.get("ts") or 0),
-            ))
-            if not mac or not hmac.compare_digest(mac, expect):
+            )
+            if not verify_hello(
+                str(data.get("pub") or ""), fields, str(data.get("sig") or "")
+            ):
                 return
 
         now = time.time()
@@ -314,6 +318,15 @@ class DiscoveryService:
             udp_port = int(data.get("udp_port", self.cfg.udp_port))
             dtype = data.get("device_type", "windows")
             proto = int(env.get("proto", 1))
+            # 版本协商：对不上就只登记进列表、**不拨号**（UI 会提示"需升级"）
+            incompatible = (
+                messages.negotiate(
+                    proto,
+                    int(data.get("proto_min") or proto),
+                    int(data.get("proto_max") or proto),
+                )
+                < 0
+            )
             if peer is None:
                 peer = Peer(
                     device_id=did,
@@ -324,6 +337,7 @@ class DiscoveryService:
                     device_type=dtype,
                     proto=proto,
                     encrypted=encrypted,
+                    incompatible=incompatible,
                     last_seen=now,
                     state=PeerState.ONLINE,
                 )
@@ -335,6 +349,7 @@ class DiscoveryService:
                     or peer.name != name
                     or peer.tcp_port != tcp_port
                     or peer.encrypted != encrypted
+                    or peer.incompatible != incompatible
                     or peer.state != PeerState.ONLINE
                 )
                 peer.ip = src_ip
@@ -344,6 +359,7 @@ class DiscoveryService:
                 peer.device_type = dtype
                 peer.proto = proto
                 peer.encrypted = encrypted
+                peer.incompatible = incompatible
                 peer.state = PeerState.ONLINE
                 peer.touch()
         if is_new:

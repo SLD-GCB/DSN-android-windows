@@ -1,159 +1,124 @@
-"""加密隧道（dsn-tunnel v3）单测。
+"""隧道（dsn-tunnel **v4**）：每设备身份的双向签名握手 + 发现报文签名。
 
-⚠ 里面的**固定向量**是跨语言一致性的锚点：Kotlin 端 `TunnelVectorTest.kt` 断言
-同样的值。任何一端动了盐/迭代/曲线/编码，这里都会红。
+⚠ 身份的**固定向量**在 `test_identity.py`（那是跨语言锚点）。
+这里测的是握手本身：双方能互相**证明身份**、篡改的报文会被拒。
 """
 import socket
 import threading
 
-from dasinong_core.network import tunnel
-from dasinong_core.protocol.frame import FrameType, read_frame, write_frame
+from dasinong_core.network.tunnel import (
+    MAGIC,
+    Tunnel,
+    hello_fields,
+    verify_hello,
+)
+from dasinong_core.security.identity import Identity
 
-PW = "dasinong-test-2026"
-PW_CN = "中文口令测试"
-
-# ── 固定向量（改动即跨端不兼容）─────────────────────────────────────
-PW_KDF8 = "2bb8681617c797d9"
-PW_FP = "a836bcb66ecfef2096fcea5cb1c1760a698fb18bdbf95eae7eef5bf1b810ea80"
-PW_CN_FP = "fb0b9bab22de0e8d7c46d3567609c6ee98129cdf81541e53fc68e3d15fb6138f"
-
-
-def test_kdf_vector():
-    key = tunnel.derive_key(PW)
-    assert len(key) == 32
-    assert key[:8].hex() == PW_KDF8
+SEED_A = bytes(range(32))
+SEED_B = bytes(reversed(range(32)))
 
 
-def test_fingerprint_vector():
-    """同口令的两台设备必须算出**同一把**身份密钥（v3 的核心约定）。"""
-    t = tunnel.Tunnel(PW)
-    try:
-        assert t.enabled
-        assert t.fingerprint == PW_FP
-        assert tunnel.Tunnel(PW).fingerprint == PW_FP       # 可复现
-    finally:
-        t.close()
+def _tunnel(seed: bytes) -> Tunnel:
+    return Tunnel(Identity.from_seed(seed))
 
 
-def test_fingerprint_vector_chinese():
-    """中文口令也要一致（确认 UTF-8 编码路径两端相同）。"""
-    t = tunnel.Tunnel(PW_CN)
-    try:
-        assert t.fingerprint == PW_CN_FP
-    finally:
-        t.close()
-
-
-def test_fingerprint_is_distinct_for_other_passphrase():
-    a = tunnel.Tunnel(PW)
-    c = tunnel.Tunnel("another-passphrase")
-    try:
-        assert a.fingerprint != c.fingerprint
-    finally:
-        a.close()
-        c.close()
-
-
-def test_empty_passphrase_means_plaintext():
-    t = tunnel.Tunnel("")
-    try:
-        assert t.enabled is False
-        assert t.fingerprint == ""
-        s1, s2 = socket.socketpair()
-        try:
-            assert t.accept(s1) is s1      # 空口令：原样返回裸 socket，不加密
-            assert t.connect(s2) is s2
-        finally:
-            s1.close()
-            s2.close()
-    finally:
-        t.close()
-
-
-def test_hello_fields_and_signature():
-    fields = tunnel.hello_fields("dev-1", "我的电脑", "windows", 37021, 37020, 1730000000123)
-    assert fields == "dev-1|我的电脑|windows|37021|37020|1730000000123"
-    t = tunnel.Tunnel(PW)
-    plain = tunnel.Tunnel("")
-    try:
-        assert t.sign_hello(fields) != ""
-        assert t.sign_hello(fields) == t.sign_hello(fields)   # 确定性
-        assert plain.sign_hello(fields) == ""                 # 未加密 → 不签名
-        # 域分离：发现签名与 AUTH 握手必须用不同的密钥
-        assert tunnel.key_for(PW, b"hello") != tunnel.key_for(PW, b"auth")
-    finally:
-        t.close()
-        plain.close()
-
-
-def test_magic_and_constants():
-    assert tunnel.MAGIC == b"DSN1"
-    assert tunnel.SALT == b"dasinong-tunnel-v1"
-    assert tunnel.ITERATIONS == 200_000
-
-
-# ── 真实 TLS 环回 ──────────────────────────────────────────────────
-
-def _loopback(pw_server: str, pw_client: str):
-    """起一个本地 TLS 服务端，客户端连上去握手并塞一帧业务数据。"""
+def _loopback(tun_server: Tunnel, tun_client: Tunnel):
+    """真 TLS 环回：前者作服务端、后者作客户端；返回 (server_auth, client_auth)。"""
     srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     port = srv.getsockname()[1]
+    box = {}
 
-    t_srv = tunnel.Tunnel(pw_server)
-    t_cli = tunnel.Tunnel(pw_client)
-    seen = {}
-
-    def server():
+    def serve() -> None:
+        raw, _ = srv.accept()
         try:
-            raw, _ = srv.accept()
-            sock = t_srv.accept(raw)
-            frame = read_frame(sock)
-            seen["frame"] = frame
-            sock.close()
-        except Exception as exc:      # noqa: BLE001 - 测试里要看具体异常
-            seen["server_err"] = exc
+            box["server"] = tun_server.accept(raw)
+        except Exception as exc:                    # pragma: no cover - 便于定位
+            box["server_error"] = exc
 
-    th = threading.Thread(target=server, daemon=True)
+    th = threading.Thread(target=serve, daemon=True)
     th.start()
-
-    client_err = None
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5)
     try:
-        raw = socket.create_connection(("127.0.0.1", port), timeout=8)
-        sock = t_cli.connect(raw, "127.0.0.1")
-        write_frame(sock, FrameType.JSON, b'{"type":"connect"}')
-        sock.close()
-    except Exception as exc:          # noqa: BLE001
-        client_err = exc
-    th.join(timeout=8)
-    srv.close()
-    t_srv.close()
-    t_cli.close()
-    return seen, client_err
+        box["client"] = tun_client.connect(conn, "127.0.0.1")
+        th.join(timeout=10)
+    finally:
+        srv.close()
+    if "server_error" in box:
+        raise box["server_error"]
+    return box["server"], box["client"]
 
 
-def test_tls_loopback_same_passphrase():
-    seen, client_err = _loopback(PW, PW)
-    assert client_err is None, f"客户端不应报错：{client_err}"
-    assert "server_err" not in seen, f"服务端不应报错：{seen.get('server_err')}"
-    assert seen["frame"] is not None
-    assert seen["frame"][0] == FrameType.JSON
-    assert b"connect" in seen["frame"][1]
+def test_mutual_identity_handshake():
+    """两端各自拿到**对方已认证的指纹**，且 nonce 一致（配对短码要用它）。"""
+    a, b = _tunnel(SEED_A), _tunnel(SEED_B)
+    server, client = _loopback(a, b)
+    try:
+        assert server.fp == b.identity.fingerprint      # 服务端认证的是"客户端"
+        assert client.fp == a.identity.fingerprint      # 客户端认证的是"服务端"
+        assert server.nonce == client.nonce and len(server.nonce) == 16
+        # 连接可用
+        client.sock.sendall(b"ping")
+        assert server.sock.recv(4) == b"ping"
+    finally:
+        server.sock.close()
+        client.sock.close()
+        a.close()
+        b.close()
 
 
-def test_tls_loopback_wrong_passphrase_rejected():
-    """口令不一致必须连不上（公钥指纹对不上）。"""
-    seen, client_err = _loopback(PW, "wrong-passphrase")
-    assert client_err is not None
-    assert isinstance(client_err, tunnel.TunnelError)
-    assert "身份" in str(client_err) or "口令" in str(client_err)
-    assert seen.get("frame") is None
+def test_handshake_is_authentication_not_trust():
+    """任意两台设备都能完成握手（证明持有自称的私钥）—— 是否信任由配对决定。"""
+    a, b = _tunnel(SEED_A), _tunnel(SEED_B)
+    server, client = _loopback(a, b)
+    try:
+        assert server.fp != client.fp                     # 两个身份确实不同
+        assert server.fp == Identity.from_seed(SEED_B).fingerprint
+    finally:
+        server.sock.close()
+        client.sock.close()
+        a.close()
+        b.close()
 
 
-def test_plaintext_loopback_both_empty():
-    seen, client_err = _loopback("", "")
-    assert client_err is None
-    assert seen.get("frame") is not None
-    assert seen["frame"][0] == FrameType.JSON
+def test_hello_fields_vector():
+    # ⚠ 跨语言锚点：Android `TunnelVectorTest.kt` 断言同一串
+    assert hello_fields("dev-1", "我的电脑", "windows", 37021, 37020, 1730000000123) == (
+        "dev-1|我的电脑|windows|37021|37020|1730000000123"
+    )
+
+
+def test_magic_and_constants():
+    assert MAGIC == b"DSN1"
+
+
+def test_hello_signature_roundtrip():
+    a = _tunnel(SEED_A)
+    try:
+        fields = hello_fields("dev-1", "手机", "android", 37021, 37020, 1730000000123)
+        sig = a.sign_hello(fields)
+        assert verify_hello(a.spki_b64, fields, sig) is True
+        # 改字段 / 换公钥 / 改签名 都必须失败
+        assert verify_hello(a.spki_b64, fields + "x", sig) is False
+        assert verify_hello(_tunnel(SEED_B).spki_b64, fields, sig) is False
+        assert verify_hello(a.spki_b64, fields, sig[:-4] + "AAAA") is False
+        assert verify_hello("", fields, sig) is False
+    finally:
+        a.close()
+
+
+def test_signature_only_valid_for_matching_key():
+    """A 的签名拿 B 的公钥来验 → 必须失败（"你是谁"只能由对应私钥证明）。"""
+    a, b = _tunnel(SEED_A), _tunnel(SEED_B)
+    try:
+        import base64
+
+        fields = hello_fields("dev-1", "手机", "android", 37021, 37020, 1730000000123)
+        sig_by_a = a.sign_hello(fields)
+        pub_b = base64.b64encode(b.identity.spki_der).decode()
+        assert verify_hello(pub_b, fields, sig_by_a) is False
+        assert verify_hello(a.spki_b64, fields, sig_by_a) is True
+    finally:
+        a.close()
+        b.close()

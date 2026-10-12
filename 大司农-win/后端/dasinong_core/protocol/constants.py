@@ -1,8 +1,9 @@
 """协议常量（与 protocol/PROTOCOL.md 严格对齐）。"""
 from __future__ import annotations
 
-PROTO_VERSION = 3
-PROTO_MIN = 1
+#: v4：每设备独立身份 + 配对确认（破坏性改动 —— 旧版客户端连不上）
+PROTO_VERSION = 5
+PROTO_MIN = 4
 
 UDP_DISCOVERY_PORT = 37020
 TCP_PORT = 37021

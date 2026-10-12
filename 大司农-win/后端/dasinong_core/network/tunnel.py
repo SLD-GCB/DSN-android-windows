@@ -1,131 +1,74 @@
-"""加密隧道（dsn-tunnel v3）—— 身份由口令派生（两端相同）。
+"""加密隧道（dsn-tunnel **v4**）—— TLS + **每设备长期身份** + 应用层双向签名认证。
 
-参照 honglu-tunnel v1（`ai酒馆/酒馆隧道.py` + `鸿胪寺/后端/隧道.kt`）的设计：
+v3 的身份是**口令派生**（同口令 = 同身份、可互相冒充）。v4 换成**每设备随机身份**，
+因此握手方式必须变：
 
   · **加密**：标准 TLS（`ssl` / OpenSSL）。**密码学一行不自己造。**
-  · **身份**：口令 --PBKDF2--> 32B 材料 --> P-256 私钥 --> 自签证书。
-    两端用同一口令推出**同一把公钥**，本端**只钉这个指纹** —— 不知道口令的人
-    推不出这把公钥，也就连不上、冒充不了。**不扫码、不比对、不手输指纹。**
-  · **TLS 之上再加一道 HMAC 双向认证**：用于给出明确的「口令不一致」报错
-    （TLS 层的报错信息含糊）。
-  · **口令为空 = 不加密**：直接走明文 TCP，不套 TLS、不跑握手。
+  · **两侧都不预知对端指纹**（对端身份事先不知道）→ TLS 层**不校验**证书链；
+    真正的身份证明放在**应用层**：双方各自用自己的私钥对
+    `方向|nonce|对端指纹` 签名，对方用**它声明的公钥**验签。
+    · 把 nonce 纳入签名 → 防重放；
+    · 把对端指纹纳入签名 → 防中继/降级。
+  · **是否信任**由**配对表**决定（控制层在知道 `device_id` 后判定）——握手只负责
+    "证明你是那把你自称的钥匙"。
+  · 发现报文的签名也从 HMAC 改为**设备私钥签名**（口令没了）。
 
 帧格式沿用 `protocol.frame`：`[len:4 大端][type:1][body]`，AUTH 用 4 个专用帧类型。
-
-## 口令密钥（域分离）
-`key(用途) = PBKDF2-HMAC-SHA256(口令, 盐 SALT + "|" + 用途, 200000, 32)`
-  · 用途 `hello` → 发现报文签名。⚠ 广播是**明文**，必须走 PBKDF2——否则
-    等于把"口令原文做 HMAC"暴露成可离线爆破的口令预言机。
-  · 用途 `auth`  → AUTH 握手。
-身份派生用的是不带用途后缀的 `PBKDF2(口令, 盐)`（保持 v3 的指纹向量不变）。
 """
 from __future__ import annotations
 
-import datetime
-import hashlib
-import hmac
+import base64
 import json
 import os
-import shutil
 import socket
 import ssl
 import tempfile
 import threading
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from ..protocol.frame import FrameType, ProtocolError, read_frame, recv_exact, write_frame
+from ..security.identity import Identity, fingerprint_of
 
-__all__ = ["SALT", "ITERATIONS", "MAGIC", "TunnelError", "Tunnel", "derive_key", "key_for", "hello_fields"]
+__all__ = [
+    "MAGIC",
+    "TunnelError",
+    "Tunnel",
+    "PeerAuth",
+    "hello_fields",
+    "verify_hello",
+]
 
-SALT = b"dasinong-tunnel-v1"
-ITERATIONS = 200_000
 MAGIC = b"DSN1"
 
 _AUTH_TIMEOUT = 20.0
 
-# P-256 曲线阶 n（派生标量时取模用）
-_P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
-
 
 class TunnelError(Exception):
-    """隧道层错误（口令不一致 / 对端不是本协议 / TLS 失败）。"""
+    """隧道建立/握手失败（对端不是本协议、签名不对、连接中断等）。"""
 
 
-# ---------------------------------------------------------------- 派生
+# ---------------------------------------------------------------- 规范化字段串
 
-def derive_key(passphrase: str) -> bytes:
-    """口令 → 32 字节密钥材料（PBKDF2-HMAC-SHA256，**不带用途后缀**）。
-
-    仅用于**身份派生**：两端同口令 → 同一把 P-256 密钥 → 同一指纹。
-    """
-    return hashlib.pbkdf2_hmac(
-        "sha256", (passphrase or "").encode("utf-8"), SALT, ITERATIONS, 32
-    )
+def hello_fields(
+    from_id: str, name: str, device_type: str,
+    tcp_port: int, udp_port: int, ts: int,
+) -> str:
+    """发现报文签名的规范化字段串（**两端必须一致**，改动即不兼容）。"""
+    return f"{from_id}|{name}|{device_type}|{tcp_port}|{udp_port}|{ts}"
 
 
-def key_for(passphrase: str, purpose: bytes) -> bytes:
-    """口令 → 某用途的 HMAC 密钥（域分离）。**两端必须一致。**"""
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        (passphrase or "").encode("utf-8"),
-        SALT + b"|" + purpose,
-        ITERATIONS,
-        32,
-    )
+def verify_hello(pub_b64: str, fields: str, sig_b64: str) -> bool:
+    """用 hello 里声明的公钥验发现报文的签名。任何异常都当失败。"""
+    try:
+        pub_der = base64.b64decode(pub_b64)
+        sig = base64.b64decode(sig_b64)
+    except (ValueError, TypeError):
+        return False
+    return Identity.verify(pub_der, fields.encode("utf-8"), sig)
 
 
-def fingerprint_of(public_key) -> str:
-    """公钥（SubjectPublicKeyInfo DER）的 SHA-256，小写十六进制。
-
-    ⚠ 这是给两端"钉"的那串。别用**整张证书**的哈希——证书里有随机序列号和有效期，
-    每次生成都不一样；只有**公钥**才是"由口令唯一决定、稳定"的。
-    """
-    from cryptography.hazmat.primitives import serialization
-
-    spki = public_key.public_bytes(
-        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    return hashlib.sha256(spki).hexdigest()
-
-
-def _build_identity(passphrase: str):
-    """口令 → (私钥, 证书PEM, 私钥PEM, 指纹)。P-256 自签。"""
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-
-    material = derive_key(passphrase)
-    d = (int.from_bytes(material, "big") % (_P256_ORDER - 1)) + 1
-    key = ec.derive_private_key(d, ec.SECP256R1())
-
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "dasinong-tunnel")])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=3650))
-        .sign(key, hashes.SHA256())
-    )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    key_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
-    return key, cert_pem, key_pem, fingerprint_of(key.public_key())
-
-
-def hello_fields(from_id: str, name: str, device_type: str, tcp_port: int, udp_port: int, ts: int) -> str:
-    """发现报文签名的规范化字段串（**两端必须一致**）。"""
-    return "|".join([from_id or "", name or "", device_type or "", str(tcp_port), str(udp_port), str(ts)])
-
-
-# ---------------------------------------------------------------- 帧小工具
+# ---------------------------------------------------------------- 帧收发小工具
 
 def _send_json(sock: socket.socket, ftype: int, obj: dict) -> None:
     write_frame(sock, ftype, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
@@ -143,96 +86,148 @@ def _read_json(sock: socket.socket) -> Tuple[int, dict]:
     return ftype, obj
 
 
+@dataclass
+class PeerAuth:
+    """一条**已完成身份认证**的连接。"""
+
+    sock: socket.socket
+    #: 已认证的对端公钥指纹（SPKI DER 的 SHA-256）
+    fp: str
+    #: 对端公钥 SPKI DER
+    pub_der: bytes
+    #: 本次握手的 nonce（原始字节；配对短码要用它）
+    nonce: bytes
+
+
 # ---------------------------------------------------------------- 握手（模块级，便于单测）
 
-def handshake_server(sock: socket.socket, passphrase: str) -> None:
-    """服务端侧：发 magic + AUTH_HELLO，校验客户端 MAC，回 AUTH_RES。"""
-    key = key_for(passphrase, b"auth")
+def handshake_server(sock: socket.socket, identity: Identity) -> PeerAuth:
+    """服务端侧：发 magic + AUTH_HELLO{nonce}，验客户端签名，回 AUTH_RES。"""
     try:
         sock.sendall(MAGIC)
-        nonce = os.urandom(16).hex()
+        nonce = os.urandom(16)
+        nonce_hex = nonce.hex()
+        # `fp` 是服务端**自报**的指纹：客户端把它纳入签名，服务端再核对自己是否真是它
         _send_json(sock, FrameType.AUTH_HELLO, {
-            "nonce": nonce, "mac": hmac.new(key, f"hello|{nonce}".encode(), hashlib.sha256).hexdigest()
-            if passphrase else "",
+            "nonce": nonce_hex, "fp": identity.fingerprint,
         })
+
         ftype, req = _read_json(sock)
         if ftype != FrameType.AUTH_REQ:
             raise TunnelError("隧道握手帧不对（预期 AUTH_REQ）")
-        mac = str(req.get("mac") or "")
-        if passphrase:
-            expect = hmac.new(key, f"client|{nonce}".encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(mac, expect):
-                _send_json(sock, FrameType.AUTH_ERR, {"错": "口令不一致"})
-                raise TunnelError("口令不一致")
-        mac2 = hmac.new(key, f"server|{nonce}".encode(), hashlib.sha256).hexdigest() if passphrase else ""
-        _send_json(sock, FrameType.AUTH_RES, {"mac2": mac2})
+        fp_c = str(req.get("fp") or "")
+        pub_c = base64.b64decode(str(req.get("pub") or "") or "")
+        sig_c = base64.b64decode(str(req.get("sig") or "") or "")
+        if not fp_c or fingerprint_of_der(pub_c) != fp_c:
+            raise TunnelError("对端公钥与声明指纹不符")
+        payload = f"client|{nonce_hex}|{identity.fingerprint}".encode("utf-8")
+        if not Identity.verify(pub_c, payload, sig_c):
+            _send_json(sock, FrameType.AUTH_ERR, {"code": "auth", "错": "对方身份签名校验未通过"})
+            raise TunnelError("对方身份签名校验未通过")
+
+        payload_s = f"server|{nonce_hex}|{fp_c}".encode("utf-8")
+        _send_json(sock, FrameType.AUTH_RES, {
+            "fp": identity.fingerprint,
+            "pub": base64.b64encode(identity.spki_der).decode("ascii"),
+            "sig": base64.b64encode(identity.sign(payload_s)).decode("ascii"),
+        })
+        return PeerAuth(sock, fp_c, pub_c, nonce)
     except TunnelError:
         raise
     except (OSError, ProtocolError) as exc:
         raise TunnelError(f"隧道握手失败：{exc}") from exc
 
 
-def handshake_client(sock: socket.socket, passphrase: str) -> None:
-    """客户端侧：收 magic + AUTH_HELLO，回 AUTH_REQ，校验服务端 MAC2。"""
-    key = key_for(passphrase, b"auth")
+def handshake_client(sock: socket.socket, identity: Identity) -> PeerAuth:
+    """客户端侧：收 magic + AUTH_HELLO，发 AUTH_REQ（带签名），验服务端签名。"""
     try:
         if recv_exact(sock, 4) != MAGIC:
             raise TunnelError("对面不是大司农隧道（magic 不对）")
         ftype, hello = _read_json(sock)
         if ftype != FrameType.AUTH_HELLO:
             raise TunnelError("隧道握手帧不对（预期 AUTH_HELLO）")
-        nonce = str(hello.get("nonce") or "")
-        if not nonce:
+        nonce_hex = str(hello.get("nonce") or "")
+        if not nonce_hex:
             raise TunnelError("隧道握手缺少 nonce")
-        mac = hmac.new(key, f"client|{nonce}".encode(), hashlib.sha256).hexdigest() if passphrase else ""
-        _send_json(sock, FrameType.AUTH_REQ, {"mac": mac})
+        nonce = bytes.fromhex(nonce_hex)
+
+        # 客户端签名覆盖：方向 + nonce + **服务端自报的指纹**
+        # （服务端会核对自己是不是那个指纹；不一致即拒 → 防中继/降级）
+        sfp = str(hello.get("fp") or "")
+        payload = f"client|{nonce_hex}|{sfp}".encode("utf-8")
+        _send_json(sock, FrameType.AUTH_REQ, {
+            "fp": identity.fingerprint,
+            "pub": base64.b64encode(identity.spki_der).decode("ascii"),
+            "sig": base64.b64encode(identity.sign(payload)).decode("ascii"),
+        })
+
         ftype, res = _read_json(sock)
         if ftype == FrameType.AUTH_ERR:
-            raise TunnelError("口令与对方不一致（对方拒绝了本次认证）")
+            raise TunnelError(str(res.get("错") or "对方拒绝了本次认证"))
         if ftype != FrameType.AUTH_RES:
             raise TunnelError("隧道握手帧不对（预期 AUTH_RES）")
-        if passphrase:
-            expect = hmac.new(key, f"server|{nonce}".encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(str(res.get("mac2") or ""), expect):
-                raise TunnelError("对方未通过口令校验（口令不一致？）")
+        fp_s = str(res.get("fp") or "")
+        pub_s = base64.b64decode(str(res.get("pub") or "") or "")
+        sig_s = base64.b64decode(str(res.get("sig") or "") or "")
+        if not fp_s or fingerprint_of_der(pub_s) != fp_s:
+            raise TunnelError("对端公钥与声明指纹不符")
+        if sfp and sfp != fp_s:
+            raise TunnelError("对端身份与它自己声明的不一致（疑似中间人）")
+        payload_s = f"server|{nonce_hex}|{identity.fingerprint}".encode("utf-8")
+        if not Identity.verify(pub_s, payload_s, sig_s):
+            raise TunnelError("对方身份签名校验未通过")
+        return PeerAuth(sock, fp_s, pub_s, nonce)
     except TunnelError:
         raise
-    except (OSError, ProtocolError) as exc:
+    except (OSError, ProtocolError, ValueError) as exc:
         raise TunnelError(f"隧道握手失败：{exc}") from exc
+
+
+def fingerprint_of_der(spki_der: bytes) -> str:
+    """SPKI DER → 指纹（与 `Identity.fingerprint` 同一算法）。"""
+    import hashlib
+
+    return hashlib.sha256(spki_der).hexdigest()
 
 
 # ---------------------------------------------------------------- 隧道上下文
 
 class Tunnel:
-    """按口令构建的隧道上下文：持有身份与 TLS 上下文，可被多线程复用。
+    """持有本机身份与 TLS 上下文，可被多线程复用。
 
-    口令为空时 `enabled=False`，`accept/connect` 原样返回裸 socket（不加密）。
+    v4 起 `enabled` 恒为 True（引擎在没身份时不启动网络，见 `NodeEngine.start`）。
     """
 
-    def __init__(self, passphrase: str = "") -> None:
-        self.passphrase = passphrase or ""
-        self.enabled = bool(self.passphrase)
+    def __init__(self, identity: Identity) -> None:
+        self.identity = identity
+        self.enabled = True
         self._lock = threading.Lock()
         self._cert_dir: Optional[str] = None
         self._server_ctx: Optional[ssl.SSLContext] = None
         self._client_ctx: Optional[ssl.SSLContext] = None
-        self._fingerprint = ""
-        if self.enabled:
-            _key, cert_pem, key_pem, self._fingerprint = _build_identity(self.passphrase)
-            # load_cert_chain 需要文件路径 → 放临时目录（整个身份只写一次）
-            self._cert_dir = tempfile.mkdtemp(prefix="dasinong-cert-")
-            self._cert_path = os.path.join(self._cert_dir, "cert.pem")
-            self._key_path = os.path.join(self._cert_dir, "key.pem")
-            with open(self._cert_path, "wb") as f:
-                f.write(cert_pem)
-            with open(self._key_path, "wb") as f:
-                f.write(key_pem)
+        # load_cert_chain 需要文件路径 → 把自签证书/私钥写进临时目录
+        self._cert_dir = tempfile.mkdtemp(prefix="dasinong-cert-")
+        self._cert_path = os.path.join(self._cert_dir, "cert.pem")
+        self._key_path = os.path.join(self._cert_dir, "key.pem")
+        with open(self._cert_path, "wb") as f:
+            f.write(identity.cert_pem())
+        with open(self._key_path, "wb") as f:
+            f.write(identity.private_pem())
 
     # ---- 对外信息 ----
     @property
     def fingerprint(self) -> str:
-        """本机隧道公钥指纹（口令为空则空串）。供人工核对。"""
-        return self._fingerprint
+        """本机身份指纹。⚠ 不外显（用户硬要求：界面不显示本机指纹）。"""
+        return self.identity.fingerprint
+
+    @property
+    def spki_b64(self) -> str:
+        return base64.b64encode(self.identity.spki_der).decode("ascii")
+
+    # ---- 发现报文签名 ----
+    def sign_hello(self, fields: str) -> str:
+        """用设备私钥签发现报文的规范化字段串（base64 的 DER 签名）。"""
+        return base64.b64encode(self.identity.sign(fields.encode("utf-8"))).decode("ascii")
 
     # ---- TLS 上下文（懒建）----
     def server_context(self) -> ssl.SSLContext:
@@ -256,72 +251,68 @@ class Tunnel:
                     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                 except (AttributeError, ValueError):
                     pass
-                # 不用 PKI 链校验：身份靠"公钥指纹钉死"（见 _verify_peer）。
+                # 对端指纹事先不知道 → 不校验证书链（身份交给应用层签名证明，见握手）
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
                 self._client_ctx = ctx
             return self._client_ctx
 
-    def _verify_peer(self, tls: ssl.SSLSocket) -> None:
-        """钉公钥指纹：与由口令推出的指纹不符 → 口令不一致，或有人在冒充。"""
-        from cryptography import x509
-
-        der = tls.getpeercert(binary_form=True)
-        if not der:
-            raise TunnelError("对端没给证书")
-        got = fingerprint_of(x509.load_der_x509_certificate(der).public_key())
-        if got != self._fingerprint:
-            raise TunnelError("对方身份对不上 —— 口令不一致，或有人在冒充")
-
-    # ---- 连接包装 ----
-    def accept(self, raw: socket.socket) -> socket.socket:
-        """服务端侧：包 TLS + 跑握手；失败抛 TunnelError。"""
-        if not self.enabled:
-            return raw
+    # ---- 包装连接 ----
+    def accept(self, raw: socket.socket) -> PeerAuth:
+        """服务端侧：TLS + 双向签名握手，返回**已认证**的对端信息。"""
         try:
+            raw.settimeout(_AUTH_TIMEOUT)
             tls = self.server_context().wrap_socket(raw, server_side=True)
         except (ssl.SSLError, OSError) as exc:
-            raise TunnelError(f"TLS 握手失败（对方可能未开加密）：{exc}") from exc
+            try:
+                raw.close()
+            except OSError:
+                pass
+            raise TunnelError(f"TLS 握手失败：{exc}") from exc
         try:
-            tls.settimeout(_AUTH_TIMEOUT)
-            handshake_server(tls, self.passphrase)
-            tls.settimeout(None)
-            return tls
+            auth = handshake_server(tls, self.identity)
         except Exception:
             try:
                 tls.close()
             except OSError:
                 pass
             raise
+        try:
+            tls.settimeout(None)
+        except OSError:
+            pass
+        return PeerAuth(tls, auth.fp, auth.pub_der, auth.nonce)
 
-    def connect(self, raw: socket.socket, host: str = "") -> socket.socket:
-        """客户端侧：包 TLS + 钉指纹 + 跑握手；失败抛 TunnelError。"""
-        if not self.enabled:
-            return raw
+    def connect(self, raw: socket.socket, host: str = "") -> PeerAuth:
+        """客户端侧：TLS + 双向签名握手，返回**已认证**的对端信息。
+
+        不覆盖调用方设的 socket 超时（直连要靠它做短超时），握手完再清掉。
+        """
         try:
             tls = self.client_context().wrap_socket(raw, server_hostname=None)
         except (ssl.SSLError, OSError) as exc:
-            raise TunnelError(f"TLS 握手失败（对方可能未开加密）：{exc}") from exc
+            try:
+                raw.close()
+            except OSError:
+                pass
+            raise TunnelError(f"TLS 握手失败：{exc}") from exc
         try:
-            tls.settimeout(_AUTH_TIMEOUT)
-            self._verify_peer(tls)
-            handshake_client(tls, self.passphrase)
-            tls.settimeout(None)
-            return tls
+            auth = handshake_client(tls, self.identity)
         except Exception:
             try:
                 tls.close()
             except OSError:
                 pass
             raise
-
-    # ---- 发现报文的签名（明文广播 → 用 PBKDF2 派生的专用密钥）----
-    def sign_hello(self, fields: str) -> str:
-        if not self.enabled:
-            return ""
-        return hmac.new(key_for(self.passphrase, b"hello"), fields.encode("utf-8"), hashlib.sha256).hexdigest()
+        try:
+            tls.settimeout(None)
+        except OSError:
+            pass
+        return PeerAuth(tls, auth.fp, auth.pub_der, auth.nonce)
 
     def close(self) -> None:
+        import shutil
+
         if self._cert_dir:
             shutil.rmtree(self._cert_dir, ignore_errors=True)
             self._cert_dir = None

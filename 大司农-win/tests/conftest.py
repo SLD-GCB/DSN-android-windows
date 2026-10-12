@@ -15,6 +15,10 @@ if not os.environ.get("DASINONG_PREFS"):
         Path(tempfile.mkdtemp(prefix="dasinong-test-prefs-")) / "config.json"
     )
 
+# v4 起首次连接要**人工确认配对**（两端显示同一个 6 位短码）。测试里没人点按钮，
+# 所以让它自动接受 —— 这是配对模块专门留给无头环境的开关，真实运行绝不设置。
+os.environ.setdefault("DASINONG_PAIR_AUTO", "1")
+
 ROOT = Path(__file__).resolve().parent.parent
 BACKEND = ROOT / "后端"
 UI = ROOT / "UI"

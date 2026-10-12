@@ -5,7 +5,7 @@ import struct
 import pytest
 
 from dasinong_core.protocol import frame, messages
-from dasinong_core.protocol.constants import MAX_FRAME, PROTO_VERSION
+from dasinong_core.protocol.constants import MAX_FRAME, PROTO_MIN, PROTO_VERSION
 
 
 def _pair():
@@ -119,9 +119,10 @@ def test_decode_invalid_returns_none():
 
 
 def test_negotiate():
-    # 双方 v2 -> 2
-    assert messages.negotiate(2, 1, 2) == 2
-    # 远端最高 1（老版本）-> 1
-    assert messages.negotiate(1, 1, 1) == 1
+    # v5：PROTO_VERSION=5 但 PROTO_MIN=4 —— v4 与 v5 **必须能互通**（缺端口池字段就退回单口）
+    assert messages.negotiate(PROTO_VERSION, PROTO_MIN, PROTO_VERSION) == PROTO_VERSION
+    assert messages.negotiate(PROTO_MIN, PROTO_MIN, PROTO_MIN) == PROTO_MIN
+    # 比 PROTO_MIN 还旧（v3 及更早）-> 不兼容
+    assert messages.negotiate(PROTO_MIN - 1, 1, PROTO_MIN - 1) == -1
     # 远端最低版本高于本机最高版本 -> 不兼容
     assert messages.negotiate(PROTO_VERSION + 1, PROTO_VERSION + 1, PROTO_VERSION + 2) == -1

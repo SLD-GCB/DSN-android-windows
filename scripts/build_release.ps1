@@ -6,8 +6,8 @@
     打包后会用 apksigner 校验签名，没签上直接失败退出。
   - Windows：PyInstaller onedir 压缩包。
 
-  产物：dist\release\大司农-android-<版本>.apk
-        dist\release\大司农-windows-<版本>.zip
+  产物：dist\release\DSN-android-<版本>.apk
+        dist\release\DSN-windows-<版本>.zip
 
   用法：
     powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
@@ -168,15 +168,16 @@ if (-not $SkipWin) {
 }
 
 # ---------------------------------------------------------------- 收集
+# 对外分发的产物统一用 DSN- 前缀（与开源仓库名 DSN-android-windows 对齐）
 Step "收集产物到 dist\release"
 New-Item -ItemType Directory -Force -Path $DistRelease | Out-Null
 if ($ApkPath) {
-    $dst = Join-Path $DistRelease "大司农-android-$Version.apk"
+    $dst = Join-Path $DistRelease "DSN-android-$Version.apk"
     Copy-Item $ApkPath $dst -Force
     Write-Host "  $dst" -ForegroundColor Green
 }
 if ($ZipPath) {
-    $dst = Join-Path $DistRelease "大司农-windows-$Version.zip"
+    $dst = Join-Path $DistRelease "DSN-windows-$Version.zip"
     Copy-Item $ZipPath $dst -Force
     Write-Host "  $dst" -ForegroundColor Green
 }

@@ -31,6 +31,22 @@ class LanNetworkBinder(private val cm: ConnectivityManager) {
 
     fun pickPrimary(): Network? = candidateLans().firstOrNull()
 
+    /**
+     * 默认网关（热点场景里它就是**热点主机**）。取不到返回 null。
+     *
+     * 用途：自动连接不做 UDP 广播等待，直接 TCP 连网关 —— 见 `NodeEngine.ensureGatewayDirect`。
+     */
+    fun defaultGateway(): String? {
+        val net = pickPrimary() ?: return null
+        val lp = cm.getLinkProperties(net) ?: return null
+        for (r in lp.routes) {
+            if (r.isDefaultRoute && r.gateway is Inet4Address) {
+                return (r.gateway as Inet4Address).hostAddress
+            }
+        }
+        return null
+    }
+
     fun sourceIp(network: Network): Inet4Address? {
         val lp = cm.getLinkProperties(network) ?: return null
         for (la in lp.linkAddresses) {

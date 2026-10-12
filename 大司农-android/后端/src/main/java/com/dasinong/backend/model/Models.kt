@@ -17,6 +17,8 @@ data class Peer(
     var deviceType: String = "android",
     var proto: Int = 3,
     var encrypted: Boolean = false,
+    /** 协议版本对不上（协商失败）：可以看见对方，但不拨号、不通信，UI 提示需升级 */
+    var incompatible: Boolean = false,
     var lastSeen: Long = System.currentTimeMillis(),
     var state: PeerState = PeerState.ONLINE,
 )

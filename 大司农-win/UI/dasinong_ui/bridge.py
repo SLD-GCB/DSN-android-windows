@@ -18,6 +18,8 @@ class Bridge(QObject):
     messageStatus = Signal(object)
     transferEvent = Signal(object)
     conversationRebound = Signal(str, str)   # (旧会话 id, 真实设备 id)
+    pairRequest = Signal(object)             # {"peer_id","name","sas"} —— 需要用户确认配对
+    pairedChanged = Signal(object)           # {"peer_id","paired"}
     log = Signal(str)
 
     def __init__(self, bus: EventBus) -> None:
@@ -42,5 +44,9 @@ class Bridge(QObject):
         elif t == EventType.CONVERSATION_REBOUND:
             old_id, new_id = event.data
             self.conversationRebound.emit(old_id, new_id)
+        elif t == EventType.PAIR_REQUEST:
+            self.pairRequest.emit(event.data)
+        elif t == EventType.PAIRED_CHANGED:
+            self.pairedChanged.emit(event.data)
         elif t == EventType.LOG:
             self.log.emit(str(event.data))
