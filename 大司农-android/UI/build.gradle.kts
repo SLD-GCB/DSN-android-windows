@@ -24,8 +24,8 @@ android {
         applicationId = "com.dasinong"
         minSdk = 26
         targetSdk = 37
-        versionCode = 45
-        versionName = "6.39"
+        versionCode = 46
+        versionName = "6.40"
     }
 
     signingConfigs {

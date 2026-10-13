@@ -1,5 +1,7 @@
 package com.dasinong.ui.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
@@ -488,7 +490,7 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var confirmClear by remember { mutableStateOf(false) }
-    var pendingDelete by remember { mutableStateOf<ChatMessage?>(null) }
+    var pendingMsg by remember { mutableStateOf<ChatMessage?>(null) }
     var showAppPicker by remember { mutableStateOf(false) }   // 分享应用
     val title = convs.firstOrNull { it.peerId == convId }?.title ?: convId.take(8)
 
@@ -538,7 +540,7 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
                         (m.transferId != null && it.transferId == m.transferId) ||
                             (m.file != null && it.file?.fileId == m.file?.fileId)
                     },
-                    onDelete = { pendingDelete = m },
+                    onLongPress = { pendingMsg = m },
                 )
             }
         }
@@ -633,26 +635,38 @@ private fun ConversationView(vm: AppViewModel, convId: String) {
         )
     }
 
-    // 长按气泡 → 删除这一条
-    pendingDelete?.let { m ->
+    // 长按气泡 → 复制 / 删除这一条
+    pendingMsg?.let { m ->
         AlertDialog(
-            onDismissRequest = { pendingDelete = null },
-            title = { Text("删除消息") },
-            text = { Text("删除这条消息？（只删本机记录，不影响对方）") },
+            onDismissRequest = { pendingMsg = null },
+            title = { Text("这条消息") },
+            text = { Text("要做什么？（删除只删本机记录，不影响对方）") },
             confirmButton = {
-                TextButton(onClick = {
-                    vm.deleteMessage(convId, m.msgId)
-                    pendingDelete = null
-                }) { Text("删除") }
+                // 只有带文字的消息（文本/系统）才谈得上复制
+                if (m.text.isNotBlank()) {
+                    TextButton(onClick = {
+                        copyText(context, m.text)
+                        toast(context, "已复制")
+                        pendingMsg = null
+                    }) { Text("复制") }
+                }
             },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        vm.deleteMessage(convId, m.msgId)
+                        pendingMsg = null
+                    }) { Text("删除") }
+                    TextButton(onClick = { pendingMsg = null }) { Text("取消") }
+                }
+            },
         )
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(msg: ChatMessage, transfer: Transfer?, onDelete: () -> Unit) {
+private fun MessageBubble(msg: ChatMessage, transfer: Transfer?, onLongPress: () -> Unit) {
     val align = if (msg.outgoing) Alignment.CenterEnd else Alignment.CenterStart
     val bg = if (msg.outgoing) MaterialTheme.colorScheme.primaryContainer
     else MaterialTheme.colorScheme.surfaceVariant
@@ -660,8 +674,8 @@ private fun MessageBubble(msg: ChatMessage, transfer: Transfer?, onDelete: () ->
         Column(
             Modifier
                 .background(bg, RoundedCornerShape(10.dp))
-                // 长按气泡 → 删除这一条
-                .combinedClickable(onClick = {}, onLongClick = onDelete)
+                // 长按气泡 → 打开消息菜单（复制 / 删除）
+                .combinedClickable(onClick = {}, onLongClick = onLongPress)
                 .padding(horizontal = 10.dp, vertical = 6.dp),
         ) {
             when (msg.kind) {
@@ -983,6 +997,14 @@ private fun mimeOf(context: Context, source: String): String {
 
 private fun toast(context: Context, message: String) {
     runCatching { Toast.makeText(context, message, Toast.LENGTH_SHORT).show() }
+}
+
+/** 把文本放进系统剪贴板（供长按消息弹窗的「复制」用）。 */
+private fun copyText(context: Context, text: String) {
+    runCatching {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("消息", text))
+    }
 }
 
 /** 人类可读的文件大小。 */
