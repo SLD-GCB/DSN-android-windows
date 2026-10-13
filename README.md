@@ -1,5 +1,9 @@
 # 大司农
 
+<p align="center">
+  <img src="docs/screen-android.jpg" width="300" alt="大司农 · 安卓端"> <img src="docs/screen-pc.png" width="500" alt="大司农 · Windows 端">
+</p>
+
 使用方法：
 
 1、若是电脑我只开发了适合Windows的版本，安卓手机当然我也开了，先下载
